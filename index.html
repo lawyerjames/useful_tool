@@ -515,6 +515,11 @@
             </div>
 
             <div class="qr-form-group">
+                <label for="captionInput">提示標示文字（顯示於 QR Code 下方）</label>
+                <input type="text" id="captionInput" placeholder="例如：台南市地政法學會提供">
+            </div>
+
+            <div class="qr-form-group">
                 <label>Logo 圖片（顯示於 QR Code 中央）</label>
                 <div class="logo-upload-area" id="logoArea">
                     <div id="logoPreview">
@@ -539,7 +544,7 @@
 
             <div class="qr-result" id="qrResult">
                 <canvas id="qrCanvas"></canvas>
-                <div class="caption">台南市地政法學會提供</div>
+                <div class="caption" id="qrCaption"></div>
                 <button class="qr-download-btn" onclick="downloadQR()">下載 QR Code</button>
             </div>
         </div>
@@ -1003,8 +1008,9 @@
             const canvas = document.getElementById('qrCanvas');
             const ctx = canvas.getContext('2d');
             const size = qrSize;
+            const hasCaption = document.getElementById('captionInput').value.trim().length > 0;
             canvas.width = size;
-            canvas.height = size + 40;
+            canvas.height = hasCaption ? size + 40 : size;
 
             const moduleCount = qr.getModuleCount();
             const padding = Math.floor(size * 0.05);
@@ -1038,7 +1044,11 @@
             ctx.fillStyle = '#4a4a8a';
             ctx.font = 'bold ' + fontSize + 'px "Microsoft JhengHei", "Noto Sans TC", sans-serif';
             ctx.textAlign = 'center';
-            ctx.fillText('台南市地政法學會提供', size / 2, size + 25);
+            const captionText = document.getElementById('captionInput').value.trim();
+            if (captionText) {
+                ctx.fillText(captionText, size / 2, size + 25);
+            }
+            document.getElementById('qrCaption').textContent = captionText;
 
             document.getElementById('qrResult').style.display = 'block';
             document.getElementById('qrResult').scrollIntoView({ behavior: 'smooth' });
@@ -1061,7 +1071,8 @@
         function downloadQR() {
             const canvas = document.getElementById('qrCanvas');
             const link = document.createElement('a');
-            link.download = 'qrcode_台南市地政法學會.png';
+            const dlCaption = document.getElementById('captionInput').value.trim() || 'qrcode';
+            link.download = dlCaption + '.png';
             link.href = canvas.toDataURL('image/png');
             link.click();
         }
