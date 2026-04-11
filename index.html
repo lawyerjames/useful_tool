@@ -369,9 +369,23 @@
             display: none;
         }
 
-        .qr-result canvas {
+        .qr-preview-wrap {
+            position: relative;
+            display: inline-block;
+        }
+
+        .qr-preview-wrap canvas {
             border-radius: 12px;
             box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            max-width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .qr-logo-overlay {
+            position: absolute;
+            object-fit: contain;
+            display: none;
         }
 
         .qr-result .caption {
@@ -516,11 +530,11 @@
 
             <div class="qr-form-group">
                 <label for="captionInput">提示標示文字（顯示於 QR Code 下方）</label>
-                <input type="text" id="captionInput" placeholder="例如：台南市地政法學會提供">
+                <input type="text" id="captionInput" placeholder="例如：國立成功大學法律學系">
             </div>
 
             <div class="qr-form-group">
-                <label>Logo 圖片（顯示於 QR Code 中央）</label>
+                <label>Logo 圖片（顯示於 QR Code 中央，建議使用正方形圖片）</label>
                 <div class="logo-upload-area" id="logoArea">
                     <div id="logoPreview">
                         <span style="font-size: 36px; color: #ccc;">+</span>
@@ -543,7 +557,10 @@
             <button class="btn" onclick="generateQR()">產生 QR Code</button>
 
             <div class="qr-result" id="qrResult">
-                <canvas id="qrCanvas"></canvas>
+                <div class="qr-preview-wrap" id="qrPreviewWrap">
+                    <canvas id="qrCanvas"></canvas>
+                    <img id="qrLogoOverlay" class="qr-logo-overlay" alt="">
+                </div>
                 <div class="caption" id="qrCaption"></div>
                 <button class="qr-download-btn" onclick="downloadQR()">下載 QR Code</button>
             </div>
@@ -968,14 +985,17 @@
         /* ══════════════════════════════════════════
            QR Code 產生器
            ══════════════════════════════════════════ */
+        let logoDataUrl = null;
         let logoImage = null;
         let qrSize = 300;
+        const LOGO_AREA_RATIO = 0.18; // 中央白色區域佔 QR Code 的比例
 
         document.getElementById('logoInput').addEventListener('change', function (e) {
             const file = e.target.files[0];
             if (!file) return;
             const reader = new FileReader();
             reader.onload = function (ev) {
+                logoDataUrl = ev.target.result;
                 const img = new Image();
                 img.onload = function () {
                     logoImage = img;
@@ -1016,9 +1036,11 @@
             const padding = Math.floor(size * 0.05);
             const cellSize = (size - padding * 2) / moduleCount;
 
+            // Draw white background
             ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+            // Draw QR modules
             for (let row = 0; row < moduleCount; row++) {
                 for (let col = 0; col < moduleCount; col++) {
                     ctx.fillStyle = qr.isDark(row, col) ? '#000000' : '#ffffff';
@@ -1028,24 +1050,40 @@
                 }
             }
 
+            // Draw fixed white square in center for logo area
+            const overlay = document.getElementById('qrLogoOverlay');
             if (logoImage) {
-                const logoSize = size * 0.22;
-                const logoX = (size - logoSize) / 2;
-                const logoY = (size - logoSize) / 2;
-                const bgPadding = logoSize * 0.1;
+                const whiteSize = size * LOGO_AREA_RATIO;
+                const whiteX = (size - whiteSize) / 2;
+                const whiteY = (size - whiteSize) / 2;
                 ctx.fillStyle = '#ffffff';
-                roundRect(ctx, logoX - bgPadding, logoY - bgPadding,
-                    logoSize + bgPadding * 2, logoSize + bgPadding * 2, 8);
+                roundRect(ctx, whiteX, whiteY, whiteSize, whiteSize, 6);
                 ctx.fill();
-                ctx.drawImage(logoImage, logoX, logoY, logoSize, logoSize);
+
+                // Position CSS overlay logo on top of canvas
+                // Calculate display scale (canvas may be scaled down by max-width)
+                overlay.src = logoDataUrl;
+                overlay.style.display = 'block';
+                const logoPad = whiteSize * 0.08;
+                const pctLeft = ((whiteX + logoPad) / canvas.width * 100).toFixed(2);
+                const pctTop = ((whiteY + logoPad) / canvas.height * 100).toFixed(2);
+                const pctW = ((whiteSize - logoPad * 2) / canvas.width * 100).toFixed(2);
+                const pctH = ((whiteSize - logoPad * 2) / canvas.height * 100).toFixed(2);
+                overlay.style.left = pctLeft + '%';
+                overlay.style.top = pctTop + '%';
+                overlay.style.width = pctW + '%';
+                overlay.style.height = pctH + '%';
+            } else {
+                overlay.style.display = 'none';
             }
 
-            const fontSize = Math.max(12, Math.floor(size * 0.045));
-            ctx.fillStyle = '#4a4a8a';
-            ctx.font = 'bold ' + fontSize + 'px "Microsoft JhengHei", "Noto Sans TC", sans-serif';
-            ctx.textAlign = 'center';
+            // Draw caption text
             const captionText = document.getElementById('captionInput').value.trim();
             if (captionText) {
+                const fontSize = Math.max(12, Math.floor(size * 0.045));
+                ctx.fillStyle = '#4a4a8a';
+                ctx.font = 'bold ' + fontSize + 'px "Microsoft JhengHei", "Noto Sans TC", sans-serif';
+                ctx.textAlign = 'center';
                 ctx.fillText(captionText, size / 2, size + 25);
             }
             document.getElementById('qrCaption').textContent = captionText;
@@ -1068,12 +1106,48 @@
             ctx.closePath();
         }
 
+        // Download: composite canvas + logo into final image
         function downloadQR() {
             const canvas = document.getElementById('qrCanvas');
+            const size = canvas.width;
+            const dlCanvas = document.createElement('canvas');
+            dlCanvas.width = canvas.width;
+            dlCanvas.height = canvas.height;
+            const dlCtx = dlCanvas.getContext('2d');
+
+            // Draw QR code (with white center)
+            dlCtx.drawImage(canvas, 0, 0);
+
+            // Draw logo on top if exists
+            if (logoImage) {
+                const whiteSize = size * LOGO_AREA_RATIO;
+                const whiteX = (size - whiteSize) / 2;
+                const whiteY = (size - whiteSize) / 2;
+                const logoPad = whiteSize * 0.08;
+                const areaW = whiteSize - logoPad * 2;
+                const areaH = whiteSize - logoPad * 2;
+                const areaX = whiteX + logoPad;
+                const areaY = whiteY + logoPad;
+
+                // Fit logo within square area preserving aspect ratio
+                const imgRatio = logoImage.naturalWidth / logoImage.naturalHeight;
+                let drawW, drawH;
+                if (imgRatio >= 1) {
+                    drawW = areaW;
+                    drawH = areaW / imgRatio;
+                } else {
+                    drawH = areaH;
+                    drawW = areaH * imgRatio;
+                }
+                const drawX = areaX + (areaW - drawW) / 2;
+                const drawY = areaY + (areaH - drawH) / 2;
+                dlCtx.drawImage(logoImage, drawX, drawY, drawW, drawH);
+            }
+
             const link = document.createElement('a');
             const dlCaption = document.getElementById('captionInput').value.trim() || 'qrcode';
             link.download = dlCaption + '.png';
-            link.href = canvas.toDataURL('image/png');
+            link.href = dlCanvas.toDataURL('image/png');
             link.click();
         }
     </script>
