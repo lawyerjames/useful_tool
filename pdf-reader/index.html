@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="data:," />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF 閱讀器</title>
+    <script type="module" crossorigin src="./assets/index-oax5B1Os.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-D1KKp_lX.css">
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="toolbar__group">
+        <label class="btn btn--primary">
+          載入 PDF
+          <input id="file-input" type="file" accept="application/pdf" hidden />
+        </label>
+        <span id="file-name" class="file-name"></span>
+      </div>
+
+      <div class="toolbar__group nav-group" data-disabled>
+        <button id="prev" class="btn" title="上一頁 (←)">‹</button>
+        <span class="page-indicator">
+          第
+          <input id="page-input" class="page-input" type="number" min="1" value="1" />
+          / <span id="page-count">0</span> 頁
+        </span>
+        <button id="next" class="btn" title="下一頁 (→)">›</button>
+      </div>
+
+      <div class="toolbar__group zoom-group" data-disabled>
+        <button id="zoom-out" class="btn" title="縮小">−</button>
+        <span id="zoom-level" class="zoom-level">100%</span>
+        <button id="zoom-in" class="btn" title="放大">+</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section id="viewer" class="viewer">
+        <div id="viewer-empty" class="viewer__empty">
+          <p>把 PDF 拖放到這裡，或點左上角「載入 PDF」</p>
+        </div>
+        <canvas id="pdf-canvas" hidden></canvas>
+      </section>
+
+      <div id="divider" class="divider" title="拖曳調整左右寬度"></div>
+
+      <aside class="text-panel">
+        <div class="text-panel__head">
+          <div class="text-panel__row">
+            <span id="status" class="status">尚未載入 PDF</span>
+            <div class="font-size-ctrl" title="調整文字大小">
+              <button id="font-dec" class="btn btn--icon" title="縮小文字">A−</button>
+              <span id="font-size-label" class="font-size-label">15px</span>
+              <button id="font-inc" class="btn btn--icon" title="放大文字">A＋</button>
+            </div>
+          </div>
+          <div class="text-panel__row text-panel__actions">
+            <button id="ocr-btn" class="btn" disabled>辨識文字 (OCR)</button>
+            <button id="strip-btn" class="btn" disabled title="移除中文字之間多餘的空白">移除空白</button>
+            <button id="copy-btn" class="btn" disabled>複製全部</button>
+          </div>
+        </div>
+        <textarea
+          id="text-output"
+          class="text-output"
+          readonly
+          placeholder="此頁文字會顯示在這裡，可直接選取複製。"
+        ></textarea>
+      </aside>
+    </main>
+
+  </body>
+</html>
