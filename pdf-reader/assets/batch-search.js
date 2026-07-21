@@ -6,6 +6,13 @@ const OCR_CONFIDENCE_WARNING = 70;
 const SEARCH_RESULT_LIMIT = 100;
 const SEARCH_DEBOUNCE_MS = 160;
 const TESSERACT_MODULE_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/+esm";
+const CJK_CHARACTERS = "\\u3000-\\u303f\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff00-\\uffef";
+const CJK_PUNCTUATION = ",.:;!?%()\\[\\]{}";
+const SMART_SPACE_PATTERNS = [
+  new RegExp(`([${CJK_CHARACTERS}])[ \\t]+(?=[${CJK_CHARACTERS}])`, "g"),
+  new RegExp(`([${CJK_CHARACTERS}])[ \\t]+(?=[${CJK_PUNCTUATION}])`, "g"),
+  new RegExp(`([${CJK_PUNCTUATION}])[ \\t]+(?=[${CJK_CHARACTERS}])`, "g")
+];
 
 const els = {
   pickFolderBtn: document.getElementById("pick-folder-btn"),
@@ -114,8 +121,21 @@ async function replaceFileIndex(fileRecord, pages) {
   await txDone(tx);
 }
 
+function removeSmartSpaces(text) {
+  let normalized = text;
+  let previous;
+  do {
+    previous = normalized;
+    for (const pattern of SMART_SPACE_PATTERNS) {
+      normalized = normalized.replace(pattern, "$1");
+    }
+  } while (normalized !== previous);
+  return normalized;
+}
+
 function normalizeSpace(text) {
-  return String(text || "").replace(/\s+/g, " ").trim();
+  const collapsed = String(text || "").replace(/\s+/g, " ").trim();
+  return removeSmartSpaces(collapsed);
 }
 
 function hasUsefulText(text) {
@@ -372,31 +392,104 @@ function renderFileNotes() {
   }).join("");
 }
 
-function makeSnippet(text, query) {
+function stripSearchQuotes(term) {
+  const quotePairs = [["\"", "\""], ["'", "'"], ["「", "」"], ["『", "』"]];
+  for (const [open, close] of quotePairs) {
+    if (term.startsWith(open) && term.endsWith(close) && term.length > open.length + close.length) {
+      return term.slice(open.length, -close.length).trim();
+    }
+  }
+  return term;
+}
+
+function parseSearchTerms(value) {
+  const seen = new Set();
+  return value
+    .split(/[&＆]+/)
+    .map(term => normalizeSpace(stripSearchQuotes(term.trim())))
+    .filter(term => {
+      const key = term.toLocaleLowerCase();
+      if (!term || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function highlightTerms(text, terms) {
   const lowerText = text.toLocaleLowerCase();
-  const lowerQuery = query.toLocaleLowerCase();
-  const index = lowerText.indexOf(lowerQuery);
-  if (index < 0) return escapeHtml(text.slice(0, 140));
-  const start = Math.max(0, index - 48);
-  const end = Math.min(text.length, index + query.length + 72);
-  return `${start ? "..." : ""}${escapeHtml(text.slice(start, index))}<mark>${escapeHtml(text.slice(index, index + query.length))}</mark>${escapeHtml(text.slice(index + query.length, end))}${end < text.length ? "..." : ""}`;
+  const hits = [];
+  for (const term of terms) {
+    const lowerTerm = term.toLocaleLowerCase();
+    let offset = 0;
+    while (offset < lowerText.length) {
+      const index = lowerText.indexOf(lowerTerm, offset);
+      if (index < 0) break;
+      hits.push({ start: index, end: index + term.length });
+      offset = index + Math.max(term.length, 1);
+    }
+  }
+  hits.sort((a, b) => a.start - b.start || b.end - a.end);
+
+  let html = "";
+  let cursor = 0;
+  for (const hit of hits) {
+    if (hit.end <= cursor) continue;
+    const start = Math.max(cursor, hit.start);
+    html += escapeHtml(text.slice(cursor, start));
+    html += `<mark>${escapeHtml(text.slice(start, hit.end))}</mark>`;
+    cursor = hit.end;
+  }
+  return html + escapeHtml(text.slice(cursor));
+}
+
+function makeSnippet(text, terms) {
+  const lowerText = text.toLocaleLowerCase();
+  const ranges = terms
+    .map(term => {
+      const index = lowerText.indexOf(term.toLocaleLowerCase());
+      return index < 0 ? null : {
+        start: Math.max(0, index - 36),
+        end: Math.min(text.length, index + term.length + 56)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.start - b.start);
+
+  if (!ranges.length) return escapeHtml(text.slice(0, 140));
+  const merged = [];
+  for (const range of ranges) {
+    const previous = merged.at(-1);
+    if (previous && range.start <= previous.end + 20) {
+      previous.end = Math.max(previous.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+
+  return merged.map(range => {
+    const snippet = highlightTerms(text.slice(range.start, range.end), terms);
+    return `${range.start ? "..." : ""}${snippet}${range.end < text.length ? "..." : ""}`;
+  }).join('<span class="result-snippet-separator"> ｜ </span>');
 }
 
 function runSearch() {
-  const query = els.search.value.trim();
-  if (!query) {
+  const terms = parseSearchTerms(els.search.value);
+  if (!terms.length) {
     els.results.innerHTML = state.indexedPages.length
       ? `<div class="empty-results">已索引 ${state.indexedPages.length} 頁，輸入文字開始搜尋。</div>`
       : '<div class="empty-results">尚未建立索引。</div>';
     return;
   }
 
-  const lowerQuery = query.toLocaleLowerCase();
+  const lowerTerms = terms.map(term => term.toLocaleLowerCase());
   const matches = state.indexedPages
-    .filter(page => page.text.toLocaleLowerCase().includes(lowerQuery))
+    .filter(page => {
+      const lowerText = page.text.toLocaleLowerCase();
+      return lowerTerms.every(term => lowerText.includes(term));
+    })
     .slice(0, SEARCH_RESULT_LIMIT);
   if (!matches.length) {
-    els.results.innerHTML = `<div class="empty-results">沒有找到「${escapeHtml(query)}」。</div>`;
+    els.results.innerHTML = `<div class="empty-results">沒有找到同頁包含「${escapeHtml(terms.join("」及「"))}」的結果。</div>`;
     return;
   }
 
@@ -406,11 +499,12 @@ function runSearch() {
     const confidence = page.method === "ocr" && Number.isFinite(page.confidence)
       ? ` · OCR 信心 ${page.confidence}%`
       : "";
+    const compound = terms.length > 1 ? ` · 同頁符合 ${terms.length} 個詞` : "";
     return `
       <button class="result-item" data-file-id="${escapeHtml(page.fileId)}" data-page="${page.page}">
         <div class="result-file">${escapeHtml(file?.path || file?.name || page.fileId)}</div>
-        <div class="result-meta">第 ${page.page} 頁${confidence}</div>
-        <div class="result-snippet">${makeSnippet(page.text, query)}</div>
+        <div class="result-meta">第 ${page.page} 頁${confidence}${compound}</div>
+        <div class="result-snippet">${makeSnippet(page.text, terms)}</div>
       </button>
     `;
   }).join("");
@@ -419,8 +513,8 @@ function runSearch() {
 async function refreshCache() {
   const [files, pages] = await Promise.all([getAll(FILE_STORE), getAll(PAGE_STORE)]);
   state.indexedFiles = files.sort((a, b) => (a.path || a.name).localeCompare(b.path || b.name));
-  state.indexedPages = pages;
-  const recognizedPages = pages.filter(page => hasUsefulText(page.text)).length;
+  state.indexedPages = pages.map(page => ({ ...page, text: normalizeSpace(page.text) }));
+  const recognizedPages = state.indexedPages.filter(page => hasUsefulText(page.text)).length;
   els.summary.textContent = `已索引 ${files.length} 份 PDF、${pages.length} 頁，其中 ${recognizedPages} 頁可搜尋。`;
   els.exportBtn.disabled = state.indexing || !pages.length;
   renderFileNotes();
