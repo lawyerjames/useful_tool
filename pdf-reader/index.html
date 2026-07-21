@@ -6,7 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PDF 閱讀器</title>
     <script type="module" crossorigin src="./assets/index-oax5B1Os.js"></script>
+    <script type="module" crossorigin src="./assets/batch-search.js"></script>
     <link rel="stylesheet" crossorigin href="./assets/index-D1KKp_lX.css">
+    <link rel="stylesheet" href="./assets/batch-search.css">
   </head>
   <body>
     <header class="toolbar">
@@ -19,13 +21,13 @@
       </div>
 
       <div class="toolbar__group nav-group" data-disabled>
-        <button id="prev" class="btn" title="上一頁 (←)">‹</button>
+        <button id="prev" class="btn" title="上一頁">‹</button>
         <span class="page-indicator">
           第
           <input id="page-input" class="page-input" type="number" min="1" value="1" />
           / <span id="page-count">0</span> 頁
         </span>
-        <button id="next" class="btn" title="下一頁 (→)">›</button>
+        <button id="next" class="btn" title="下一頁">›</button>
       </div>
 
       <div class="toolbar__group zoom-group" data-disabled>
@@ -43,7 +45,7 @@
         <canvas id="pdf-canvas" hidden></canvas>
       </section>
 
-      <div id="divider" class="divider" title="拖曳調整左右寬度"></div>
+      <div id="divider" class="divider" title="拖曳調整文字面板寬度"></div>
 
       <aside class="text-panel">
         <div class="text-panel__head">
@@ -68,7 +70,31 @@
           placeholder="此頁文字會顯示在這裡，可直接選取複製。"
         ></textarea>
       </aside>
-    </main>
 
+      <aside class="batch-panel">
+        <div class="batch-panel__head">
+          <div class="batch-panel__title">批次索引</div>
+          <div class="batch-panel__actions">
+            <button id="pick-folder-btn" class="btn btn--primary">選擇資料夾</button>
+            <label class="btn">
+              選擇 PDF
+              <input id="batch-file-input" type="file" accept="application/pdf" multiple hidden />
+            </label>
+            <button id="clear-index-btn" class="btn">清除索引</button>
+          </div>
+          <div id="batch-status" class="batch-status">索引保存在此瀏覽器的本機 IndexedDB。</div>
+          <progress id="batch-progress" class="batch-progress" max="100" value="0" hidden></progress>
+        </div>
+
+        <div class="search-box">
+          <input id="search-input" class="search-input" type="search" placeholder="搜尋已索引文字" />
+          <button id="export-text-btn" class="btn" disabled>匯出文字</button>
+        </div>
+
+        <div id="index-summary" class="index-summary"></div>
+        <div id="index-files" class="index-files" aria-live="polite"></div>
+        <div id="search-results" class="search-results"></div>
+      </aside>
+    </main>
   </body>
 </html>

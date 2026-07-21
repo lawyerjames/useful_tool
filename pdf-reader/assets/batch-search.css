@@ -1,0 +1,42 @@
+.index-files {
+  max-height: 180px;
+  overflow: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.file-index-item {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+}
+
+.file-index-item:last-child {
+  border-bottom: 0;
+}
+
+.file-index-item--warning {
+  padding-left: 9px;
+  border-left: 3px solid #d97706;
+}
+
+.file-index-name {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-index-metrics {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.file-index-help {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
