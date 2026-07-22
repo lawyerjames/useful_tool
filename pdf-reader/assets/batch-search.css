@@ -4,6 +4,15 @@
   border-bottom: 1px solid var(--border);
 }
 
+#batch-divider {
+  touch-action: none;
+}
+
+body.is-resizing-panels {
+  cursor: col-resize;
+  user-select: none;
+}
+
 .file-index-item {
   padding: 9px 12px;
   border-bottom: 1px solid var(--border);

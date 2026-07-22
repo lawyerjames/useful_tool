@@ -30,7 +30,12 @@ const els = {
   readerPageInput: document.getElementById("page-input"),
   readerPageCount: document.getElementById("page-count"),
   readerStatus: document.getElementById("status"),
-  readerText: document.getElementById("text-output")
+  readerText: document.getElementById("text-output"),
+  readerCopyBtn: document.getElementById("copy-btn"),
+  readerStripBtn: document.getElementById("strip-btn"),
+  batchDivider: document.getElementById("batch-divider"),
+  batchPanel: document.querySelector(".batch-panel"),
+  workspace: document.querySelector(".workspace")
 };
 
 const state = {
@@ -583,11 +588,54 @@ async function openResult(fileId, pageNumber) {
         `無法切換到第 ${pageNumber} 頁`
       );
     }
+
+    const indexedPage = state.indexedPages.find(page => (
+      page.fileId === fileId && page.page === pageNumber
+    ));
+    if (indexedPage && hasUsefulText(indexedPage.text)) {
+      els.readerText.value = indexedPage.text;
+      els.readerCopyBtn.disabled = false;
+      els.readerStripBtn.disabled = false;
+      const source = indexedPage.method === "ocr" ? "OCR" : "PDF 文字層";
+      const confidence = indexedPage.method === "ocr" && Number.isFinite(indexedPage.confidence)
+        ? `，信心 ${indexedPage.confidence}%`
+        : "";
+      els.readerStatus.textContent = `已套用批次索引文字（${source}${confidence}）`;
+    }
   } catch (error) {
     console.error(error);
     setStatus(error.message || String(error));
   }
 }
+
+let resizingBatchPanel = false;
+
+function resizeBatchPanel(clientX) {
+  const workspaceRect = els.workspace.getBoundingClientRect();
+  const dividerWidth = els.batchDivider.getBoundingClientRect().width;
+  const minimumWidth = 280;
+  const roomForViewerAndText = 200 + 220 + dividerWidth * 2;
+  const maximumWidth = Math.max(minimumWidth, workspaceRect.width - roomForViewerAndText);
+  const width = Math.min(maximumWidth, Math.max(minimumWidth, workspaceRect.right - clientX));
+  els.batchPanel.style.flexBasis = `${width}px`;
+}
+
+els.batchDivider.addEventListener("mousedown", event => {
+  if (getComputedStyle(els.batchDivider).display === "none") return;
+  resizingBatchPanel = true;
+  document.body.classList.add("is-resizing-panels");
+  event.preventDefault();
+});
+
+window.addEventListener("mousemove", event => {
+  if (resizingBatchPanel) resizeBatchPanel(event.clientX);
+});
+
+window.addEventListener("mouseup", () => {
+  if (!resizingBatchPanel) return;
+  resizingBatchPanel = false;
+  document.body.classList.remove("is-resizing-panels");
+});
 
 async function exportText() {
   const files = new Map(state.indexedFiles.map(file => [file.id, file]));
