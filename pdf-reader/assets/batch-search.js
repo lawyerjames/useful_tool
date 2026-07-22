@@ -3,6 +3,13 @@ const DB_VERSION = 1;
 const PAGE_STORE = "pages";
 const FILE_STORE = "files";
 const OCR_CONFIDENCE_WARNING = 70;
+const OCR_RETRY_CONFIDENCE = 60;
+const OCR_FAST_MAX_PIXELS = 2000000;
+const OCR_DETAIL_MAX_PIXELS = 4000000;
+const OCR_FAST_MAX_SCALE = 1.8;
+const OCR_DETAIL_MAX_SCALE = 2.5;
+const OCR_FAST_MAX_EDGE = 4096;
+const OCR_DETAIL_MAX_EDGE = 6144;
 const SEARCH_RESULT_LIMIT = 100;
 const SEARCH_DEBOUNCE_MS = 160;
 const TESSERACT_MODULE_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/+esm";
@@ -157,13 +164,25 @@ function extractTextItems(content) {
   return normalizeSpace(text);
 }
 
-async function renderPageForOcr(page) {
-  const viewport = page.getViewport({ scale: 2.2 });
+function getAdaptiveOcrScale(page, maxPixels, maxScale, maxEdge) {
+  const baseViewport = page.getViewport({ scale: 1 });
+  const basePixels = Math.max(1, baseViewport.width * baseViewport.height);
+  const pixelScale = Math.sqrt(maxPixels / basePixels);
+  const edgeScale = maxEdge / Math.max(baseViewport.width, baseViewport.height, 1);
+  return Math.max(0.25, Math.min(maxScale, pixelScale, edgeScale));
+}
+
+async function renderPageForOcr(page, profile) {
+  const scale = getAdaptiveOcrScale(page, profile.maxPixels, profile.maxScale, profile.maxEdge);
+  const viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas");
   canvas.width = Math.ceil(viewport.width);
   canvas.height = Math.ceil(viewport.height);
-  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-  return canvas;
+  const context = canvas.getContext("2d", { alpha: false });
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: context, viewport }).promise;
+  return { canvas, scale };
 }
 
 async function getOcrWorker() {
@@ -184,21 +203,74 @@ async function getOcrWorker() {
   return state.ocrWorkerPromise;
 }
 
-async function recognizePage(page, label) {
-  const canvas = await renderPageForOcr(page);
-  state.currentOcrLabel = label;
+function releaseCanvas(canvas) {
+  canvas.width = 1;
+  canvas.height = 1;
+  canvas.remove();
+}
+
+async function runOcrPass(page, label, profile) {
+  setStatus(`${label}：準備${profile.name}辨識…`);
+  const { canvas, scale } = await renderPageForOcr(page, profile);
+  state.currentOcrLabel = `${label}（${profile.name}）`;
   try {
     const worker = await getOcrWorker();
     const { data } = await worker.recognize(canvas);
     return {
       text: normalizeSpace(data.text),
-      confidence: Number.isFinite(data.confidence) ? Math.round(data.confidence) : null
+      confidence: Number.isFinite(data.confidence) ? Math.round(data.confidence) : null,
+      scale
     };
   } finally {
     state.currentOcrLabel = "";
-    canvas.width = 1;
-    canvas.height = 1;
+    releaseCanvas(canvas);
   }
+}
+
+function usefulCharacterCount(text) {
+  return String(text || "").replace(/\s/g, "").length;
+}
+
+function shouldRetryOcr(result) {
+  return usefulCharacterCount(result.text) < 8
+    || !Number.isFinite(result.confidence)
+    || result.confidence < OCR_RETRY_CONFIDENCE;
+}
+
+function ocrResultScore(result) {
+  const confidence = Number.isFinite(result.confidence) ? result.confidence : 0;
+  return confidence + Math.min(usefulCharacterCount(result.text), 200) / 4;
+}
+
+async function recognizePage(page, label) {
+  const fastProfile = {
+    name: "快速",
+    maxPixels: OCR_FAST_MAX_PIXELS,
+    maxScale: OCR_FAST_MAX_SCALE,
+    maxEdge: OCR_FAST_MAX_EDGE
+  };
+  const detailProfile = {
+    name: "精細",
+    maxPixels: OCR_DETAIL_MAX_PIXELS,
+    maxScale: OCR_DETAIL_MAX_SCALE,
+    maxEdge: OCR_DETAIL_MAX_EDGE
+  };
+  const fastResult = await runOcrPass(page, label, fastProfile);
+  const detailScale = getAdaptiveOcrScale(
+    page,
+    detailProfile.maxPixels,
+    detailProfile.maxScale,
+    detailProfile.maxEdge
+  );
+
+  if (!shouldRetryOcr(fastResult) || detailScale <= fastResult.scale * 1.05) {
+    return fastResult;
+  }
+
+  const detailResult = await runOcrPass(page, label, detailProfile);
+  return ocrResultScore(detailResult) >= ocrResultScore(fastResult)
+    ? detailResult
+    : fastResult;
 }
 
 function calculateMetrics(pages) {
