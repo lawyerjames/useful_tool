@@ -1,3 +1,9 @@
+import {
+  buildSearchDocument,
+  evaluatePageSearch,
+  normalizeSearchText
+} from "./search-utils.mjs";
+
 const DB_NAME = "pdf-reader-batch-index-v2";
 const DB_VERSION = 1;
 const PAGE_STORE = "pages";
@@ -28,6 +34,7 @@ const els = {
   status: document.getElementById("batch-status"),
   progress: document.getElementById("batch-progress"),
   search: document.getElementById("search-input"),
+  searchMode: document.getElementById("search-mode"),
   results: document.getElementById("search-results"),
   summary: document.getElementById("index-summary"),
   files: document.getElementById("index-files"),
@@ -485,56 +492,43 @@ function parseSearchTerms(value) {
     .split(/[&＆]+/)
     .map(term => normalizeSpace(stripSearchQuotes(term.trim())))
     .filter(term => {
-      const key = term.toLocaleLowerCase();
-      if (!term || seen.has(key)) return false;
+      const key = normalizeSearchText(term);
+      if (!term || !key || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
 }
 
-function highlightTerms(text, terms) {
-  const lowerText = text.toLocaleLowerCase();
-  const hits = [];
-  for (const term of terms) {
-    const lowerTerm = term.toLocaleLowerCase();
-    let offset = 0;
-    while (offset < lowerText.length) {
-      const index = lowerText.indexOf(lowerTerm, offset);
-      if (index < 0) break;
-      hits.push({ start: index, end: index + term.length });
-      offset = index + Math.max(term.length, 1);
-    }
-  }
-  hits.sort((a, b) => a.start - b.start || b.end - a.end);
-
+function highlightRanges(text, ranges) {
+  const sortedRanges = ranges
+    .filter(range => range && range.end > range.start)
+    .sort((a, b) => a.start - b.start || b.end - a.end);
   let html = "";
   let cursor = 0;
-  for (const hit of hits) {
-    if (hit.end <= cursor) continue;
-    const start = Math.max(cursor, hit.start);
+  for (const range of sortedRanges) {
+    if (range.end <= cursor) continue;
+    const start = Math.max(cursor, range.start);
     html += escapeHtml(text.slice(cursor, start));
-    html += `<mark>${escapeHtml(text.slice(start, hit.end))}</mark>`;
-    cursor = hit.end;
+    html += `<mark>${escapeHtml(text.slice(start, range.end))}</mark>`;
+    cursor = range.end;
   }
   return html + escapeHtml(text.slice(cursor));
 }
 
-function makeSnippet(text, terms) {
-  const lowerText = text.toLocaleLowerCase();
-  const ranges = terms
-    .map(term => {
-      const index = lowerText.indexOf(term.toLocaleLowerCase());
-      return index < 0 ? null : {
-        start: Math.max(0, index - 36),
-        end: Math.min(text.length, index + term.length + 56)
-      };
-    })
+function makeSnippet(text, termMatches) {
+  const hitRanges = termMatches
     .filter(Boolean)
+    .map(match => ({ start: match.start, end: match.end }));
+  const snippetRanges = hitRanges
+    .map(range => ({
+      start: Math.max(0, range.start - 36),
+      end: Math.min(text.length, range.end + 56)
+    }))
     .sort((a, b) => a.start - b.start);
 
-  if (!ranges.length) return escapeHtml(text.slice(0, 140));
+  if (!snippetRanges.length) return escapeHtml(text.slice(0, 140));
   const merged = [];
-  for (const range of ranges) {
+  for (const range of snippetRanges) {
     const previous = merged.at(-1);
     if (previous && range.start <= previous.end + 20) {
       previous.end = Math.max(previous.end, range.end);
@@ -544,10 +538,23 @@ function makeSnippet(text, terms) {
   }
 
   return merged.map(range => {
-    const snippet = highlightTerms(text.slice(range.start, range.end), terms);
+    const localHits = hitRanges
+      .filter(hit => hit.end > range.start && hit.start < range.end)
+      .map(hit => ({
+        start: Math.max(0, hit.start - range.start),
+        end: Math.min(range.end, hit.end) - range.start
+      }));
+    const snippet = highlightRanges(text.slice(range.start, range.end), localHits);
     return `${range.start ? "..." : ""}${snippet}${range.end < text.length ? "..." : ""}`;
   }).join('<span class="result-snippet-separator"> ｜ </span>');
 }
+
+const SEARCH_TIER_DETAILS = {
+  exact: { label: "完全符合", rank: 0 },
+  normalized: { label: "正規化符合", rank: 1 },
+  fuzzy: { label: "疑似符合", rank: 2 },
+  partial: { label: "部分符合", rank: 3 }
+};
 
 function runSearch() {
   const terms = parseSearchTerms(els.search.value);
@@ -558,30 +565,53 @@ function runSearch() {
     return;
   }
 
-  const lowerTerms = terms.map(term => term.toLocaleLowerCase());
+  const mode = els.searchMode.value;
   const matches = state.indexedPages
-    .filter(page => {
-      const lowerText = page.text.toLocaleLowerCase();
-      return lowerTerms.every(term => lowerText.includes(term));
-    })
-    .slice(0, SEARCH_RESULT_LIMIT);
+    .map(page => ({
+      page,
+      evaluation: evaluatePageSearch(page.searchDocument, terms, mode)
+    }))
+    .filter(item => item.evaluation)
+    .sort((left, right) => (
+      SEARCH_TIER_DETAILS[left.evaluation.tier].rank - SEARCH_TIER_DETAILS[right.evaluation.tier].rank
+      || right.evaluation.score - left.evaluation.score
+      || left.page.fileId.localeCompare(right.page.fileId)
+      || left.page.page - right.page.page
+    ));
   if (!matches.length) {
-    els.results.innerHTML = `<div class="empty-results">沒有找到同頁包含「${escapeHtml(terms.join("」及「"))}」的結果。</div>`;
+    const modeHelp = mode === "strict"
+      ? "可切換成「防漏」模式，查看部分條件或模糊符合的頁面。"
+      : "沒有發現完全、模糊或部分符合的頁面。";
+    els.results.innerHTML = `<div class="empty-results">沒有找到「${escapeHtml(terms.join("」及「"))}」。${modeHelp}</div>`;
     return;
   }
 
   const files = new Map(state.indexedFiles.map(file => [file.id, file]));
-  els.results.innerHTML = matches.map(page => {
+  const visibleMatches = matches.slice(0, SEARCH_RESULT_LIMIT);
+  const summary = mode === "recall"
+    ? `防漏模式找到 ${matches.length} 頁，包含模糊及部分條件符合。`
+    : `嚴格模式找到 ${matches.length} 頁，每個條件都必須符合。`;
+  els.results.innerHTML = `
+    <div class="search-result-summary">
+      ${summary}${matches.length > SEARCH_RESULT_LIMIT ? ` 僅顯示前 ${SEARCH_RESULT_LIMIT} 筆。` : ""}
+    </div>
+  ` + visibleMatches.map(({ page, evaluation }) => {
     const file = files.get(page.fileId);
     const confidence = page.method === "ocr" && Number.isFinite(page.confidence)
       ? ` · OCR 信心 ${page.confidence}%`
       : "";
-    const compound = terms.length > 1 ? ` · 同頁符合 ${terms.length} 個詞` : "";
+    const compound = terms.length > 1
+      ? ` · 同頁符合 ${evaluation.matchedCount}/${terms.length} 個詞`
+      : "";
+    const tier = SEARCH_TIER_DETAILS[evaluation.tier];
     return `
       <button class="result-item" data-file-id="${escapeHtml(page.fileId)}" data-page="${page.page}">
         <div class="result-file">${escapeHtml(file?.path || file?.name || page.fileId)}</div>
-        <div class="result-meta">第 ${page.page} 頁${confidence}${compound}</div>
-        <div class="result-snippet">${makeSnippet(page.text, terms)}</div>
+        <div class="result-meta">
+          <span class="result-match-badge result-match-badge--${evaluation.tier}">${tier.label}</span>
+          相似度 ${evaluation.score}% · 第 ${page.page} 頁${confidence}${compound}
+        </div>
+        <div class="result-snippet">${makeSnippet(page.text, evaluation.termMatches)}</div>
       </button>
     `;
   }).join("");
@@ -590,7 +620,10 @@ function runSearch() {
 async function refreshCache() {
   const [files, pages] = await Promise.all([getAll(FILE_STORE), getAll(PAGE_STORE)]);
   state.indexedFiles = files.sort((a, b) => (a.path || a.name).localeCompare(b.path || b.name));
-  state.indexedPages = pages.map(page => ({ ...page, text: normalizeSpace(page.text) }));
+  state.indexedPages = pages.map(page => {
+    const text = normalizeSpace(page.text);
+    return { ...page, text, searchDocument: buildSearchDocument(text) };
+  });
   const recognizedPages = state.indexedPages.filter(page => hasUsefulText(page.text)).length;
   els.summary.textContent = `已索引 ${files.length} 份 PDF、${pages.length} 頁，其中 ${recognizedPages} 頁可搜尋。`;
   els.exportBtn.disabled = state.indexing || !pages.length;
@@ -771,6 +804,7 @@ els.search.addEventListener("input", () => {
 });
 
 els.search.addEventListener("keydown", event => event.stopPropagation());
+els.searchMode.addEventListener("change", runSearch);
 
 els.results.addEventListener("click", event => {
   const item = event.target.closest(".result-item");

@@ -90,6 +90,10 @@
 
         <div class="search-box">
           <input id="search-input" class="search-input" type="search" placeholder="搜尋；複合條件用 & 連接" title="例如：筆錄 & 雷迪宇（必須出現在同一頁）" />
+          <select id="search-mode" class="search-mode-select" title="嚴格模式要求所有條件符合；防漏模式會列出少一個條件的疑似結果">
+            <option value="strict">嚴格</option>
+            <option value="recall">防漏</option>
+          </select>
           <button id="export-text-btn" class="btn" disabled>匯出文字</button>
         </div>
 
