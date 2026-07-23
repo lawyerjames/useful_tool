@@ -34,6 +34,10 @@
         <button id="zoom-out" class="btn" title="縮小">−</button>
         <span id="zoom-level" class="zoom-level">100%</span>
         <button id="zoom-in" class="btn" title="放大">+</button>
+        <select id="page-layout" class="page-layout-select" aria-label="PDF 預覽頁數">
+          <option value="single" selected>單頁</option>
+          <option value="spread">雙頁</option>
+        </select>
       </div>
     </header>
 
@@ -43,6 +47,8 @@
           <p>把 PDF 拖放到這裡，或點左上角「載入 PDF」</p>
         </div>
         <canvas id="pdf-canvas" hidden></canvas>
+        <div id="pdf-highlight-layer" class="pdf-highlight-layer" hidden aria-hidden="true"></div>
+        <canvas id="pdf-canvas-secondary" hidden></canvas>
       </section>
 
       <div id="divider" class="divider" title="拖曳調整文字面板寬度"></div>
@@ -89,6 +95,11 @@
             <button id="pause-index-btn" class="btn" disabled>暫停</button>
             <button id="clear-index-btn" class="btn" title="清除所有本機索引">清除</button>
             <span class="commandbar-separator" aria-hidden="true"></span>
+            <select id="ocr-mode" class="ocr-mode-select" aria-label="批次 OCR 辨識模式" title="選擇批次 OCR 的速度與精準度">
+              <option value="quick">快速</option>
+              <option value="balanced" selected>平衡</option>
+              <option value="accurate">精準</option>
+            </select>
             <button id="export-text-btn" class="btn" disabled title="匯出全部索引文字">匯文字</button>
             <button id="export-review-btn" class="btn" disabled title="匯出品質複核清單">匯複核</button>
           </div>

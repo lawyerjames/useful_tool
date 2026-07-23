@@ -23,17 +23,47 @@ const OCR_FAST_MAX_SCALE = 1.8;
 const OCR_DETAIL_MAX_SCALE = 2.5;
 const OCR_FAST_MAX_EDGE = 4096;
 const OCR_DETAIL_MAX_EDGE = 6144;
-const OCR_FAST_PROFILE = {
-  name: "快速",
-  maxPixels: OCR_FAST_MAX_PIXELS,
-  maxScale: OCR_FAST_MAX_SCALE,
-  maxEdge: OCR_FAST_MAX_EDGE
-};
 const OCR_DETAIL_PROFILE = {
   name: "精細",
   maxPixels: OCR_DETAIL_MAX_PIXELS,
   maxScale: OCR_DETAIL_MAX_SCALE,
   maxEdge: OCR_DETAIL_MAX_EDGE
+};
+const OCR_MODE_STORAGE_KEY = "pdfReader.batchOcrMode";
+const OCR_MODES = {
+  quick: {
+    label: "快速",
+    concurrency: 2,
+    retryConfidence: null,
+    fastProfile: {
+      name: "快速",
+      maxPixels: 1200000,
+      maxScale: 1.35,
+      maxEdge: 3000
+    }
+  },
+  balanced: {
+    label: "平衡",
+    concurrency: 2,
+    retryConfidence: 45,
+    fastProfile: {
+      name: "平衡",
+      maxPixels: 1500000,
+      maxScale: 1.55,
+      maxEdge: 3400
+    }
+  },
+  accurate: {
+    label: "精準",
+    concurrency: 1,
+    retryConfidence: OCR_RETRY_CONFIDENCE,
+    fastProfile: {
+      name: "精準",
+      maxPixels: OCR_FAST_MAX_PIXELS,
+      maxScale: OCR_FAST_MAX_SCALE,
+      maxEdge: OCR_FAST_MAX_EDGE
+    }
+  }
 };
 const SEARCH_RESULT_LIMIT = 100;
 const AUDIT_DISPLAY_LIMIT = 200;
@@ -54,6 +84,7 @@ const els = {
   status: document.getElementById("batch-status"),
   progress: document.getElementById("batch-progress"),
   pauseBtn: document.getElementById("pause-index-btn"),
+  ocrMode: document.getElementById("ocr-mode"),
   search: document.getElementById("search-input"),
   searchMode: document.getElementById("search-mode"),
   results: document.getElementById("search-results"),
@@ -68,8 +99,18 @@ const els = {
   batchPanels: Array.from(document.querySelectorAll("[data-batch-panel]")),
   readerFileInput: document.getElementById("file-input"),
   readerFileName: document.getElementById("file-name"),
+  readerViewer: document.getElementById("viewer"),
+  readerPrimaryCanvas: document.getElementById("pdf-canvas"),
+  readerSecondaryCanvas: document.getElementById("pdf-canvas-secondary"),
+  readerHighlightLayer: document.getElementById("pdf-highlight-layer"),
+  readerPageLayout: document.getElementById("page-layout"),
   readerPageInput: document.getElementById("page-input"),
   readerPageCount: document.getElementById("page-count"),
+  readerPrevBtn: document.getElementById("prev"),
+  readerNextBtn: document.getElementById("next"),
+  readerZoomInBtn: document.getElementById("zoom-in"),
+  readerZoomOutBtn: document.getElementById("zoom-out"),
+  readerZoomLevel: document.getElementById("zoom-level"),
   readerStatus: document.getElementById("status"),
   readerText: document.getElementById("text-output"),
   readerCopyBtn: document.getElementById("copy-btn"),
@@ -86,13 +127,20 @@ const state = {
   indexedFiles: [],
   indexedPages: [],
   searchTimer: null,
-  ocrWorkerPromise: null,
-  currentOcrLabel: "",
+  ocrModulePromise: null,
+  ocrWorkerPromises: [],
+  currentOcrLabels: [],
   reviewingPageId: null,
   pauseAvailable: false,
   pauseRequested: false,
   paused: false,
-  pauseResolvers: []
+  pauseResolvers: [],
+  readerPreviewPdf: null,
+  readerPreviewFileName: "",
+  readerPreviewToken: 0,
+  activeHighlight: null,
+  highlightToken: 0,
+  currentSearchTerms: []
 };
 
 function setStatus(message) {
@@ -103,6 +151,10 @@ function setProgress(done, total) {
   els.progress.hidden = !total;
   els.progress.max = Math.max(total, 1);
   els.progress.value = done;
+}
+
+function selectedOcrMode() {
+  return OCR_MODES[els.ocrMode.value] || OCR_MODES.balanced;
 }
 
 function updatePauseButton() {
@@ -129,6 +181,7 @@ function setIndexing(active, pauseAvailable = false) {
   els.fileInput.disabled = active;
   els.clearBtn.disabled = active;
   els.exportBtn.disabled = active || !state.indexedPages.length;
+  els.ocrMode.disabled = active;
   updatePauseButton();
   renderQualityAudit();
 }
@@ -217,6 +270,65 @@ async function replaceFileIndex(fileRecord, pages) {
   await txDone(tx);
 }
 
+async function upsertFileIndexPage(fileRecord, page) {
+  const db = await openDb();
+  const tx = db.transaction([FILE_STORE, PAGE_STORE], "readwrite");
+  tx.objectStore(PAGE_STORE).put(page);
+  tx.objectStore(FILE_STORE).put(fileRecord);
+  await txDone(tx);
+}
+
+async function putFileRecord(fileRecord) {
+  const db = await openDb();
+  const tx = db.transaction(FILE_STORE, "readwrite");
+  tx.objectStore(FILE_STORE).put(fileRecord);
+  await txDone(tx);
+}
+
+async function putPageRecord(page) {
+  const db = await openDb();
+  const tx = db.transaction(PAGE_STORE, "readwrite");
+  tx.objectStore(PAGE_STORE).put(page);
+  await txDone(tx);
+}
+
+async function getFileIndexSnapshot(fileId) {
+  const db = await openDb();
+  const tx = db.transaction([FILE_STORE, PAGE_STORE], "readonly");
+  const completion = txDone(tx);
+  const recordRequest = tx.objectStore(FILE_STORE).get(fileId);
+  const pagesRequest = tx.objectStore(PAGE_STORE).index("fileId").getAll(fileId);
+  const [record, pages] = await Promise.all([
+    requestToPromise(recordRequest),
+    requestToPromise(pagesRequest)
+  ]);
+  await completion;
+  return {
+    record,
+    pages: pages.sort((left, right) => left.page - right.page)
+  };
+}
+
+async function createFileFingerprint(file) {
+  const sampleSize = 65536;
+  const first = await file.slice(0, sampleSize).arrayBuffer();
+  const lastStart = Math.max(0, file.size - sampleSize);
+  const last = await file.slice(lastStart, file.size).arrayBuffer();
+  const metadata = new TextEncoder().encode(`${file.size}:${file.name}:`);
+  const bytes = new Uint8Array(metadata.length + first.byteLength + last.byteLength);
+  bytes.set(metadata, 0);
+  bytes.set(new Uint8Array(first), metadata.length);
+  bytes.set(new Uint8Array(last), metadata.length + first.byteLength);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, "0")).join("");
+}
+
+function fileMatchesIndex(file, fingerprint, record) {
+  if (!record || record.size !== file.size) return false;
+  if (record.fingerprint && fingerprint) return record.fingerprint === fingerprint;
+  return record.lastModified === file.lastModified;
+}
+
 function removeSmartSpaces(text) {
   let normalized = text;
   let previous;
@@ -232,6 +344,18 @@ function removeSmartSpaces(text) {
 function normalizeSpace(text) {
   const collapsed = String(text || "").replace(/\s+/g, " ").trim();
   return removeSmartSpaces(collapsed);
+}
+
+function combineSearchSources(...values) {
+  const seen = new Set();
+  const sources = [];
+  for (const value of values) {
+    const source = normalizeSpace(value);
+    if (!source || seen.has(source)) continue;
+    seen.add(source);
+    sources.push(source);
+  }
+  return sources.join("\n");
 }
 
 function hasUsefulText(text) {
@@ -269,22 +393,46 @@ async function renderPageForOcr(page, profile) {
   return { canvas, scale };
 }
 
-async function getOcrWorker() {
-  if (!state.ocrWorkerPromise) {
-    state.ocrWorkerPromise = import(TESSERACT_MODULE_URL)
+function isLikelyBlankCanvas(canvas) {
+  const sample = document.createElement("canvas");
+  sample.width = 64;
+  sample.height = 64;
+  const context = sample.getContext("2d", { alpha: false, willReadFrequently: true });
+  context.drawImage(canvas, 0, 0, sample.width, sample.height);
+  const pixels = context.getImageData(0, 0, sample.width, sample.height).data;
+  let darkPixels = 0;
+  for (let index = 0; index < pixels.length; index += 4) {
+    const luminance = (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3;
+    if (luminance < 238) darkPixels += 1;
+  }
+  sample.width = 1;
+  sample.height = 1;
+  return darkPixels / (pixels.length / 4) < 0.0015;
+}
+
+async function getOcrWorker(slot) {
+  if (!state.ocrModulePromise) {
+    state.ocrModulePromise = import(TESSERACT_MODULE_URL).catch(error => {
+      state.ocrModulePromise = null;
+      throw new Error(`無法載入 OCR 引擎：${error.message || error}`);
+    });
+  }
+  if (!state.ocrWorkerPromises[slot]) {
+    state.ocrWorkerPromises[slot] = state.ocrModulePromise
       .then(({ createWorker }) => createWorker("chi_tra+eng", 1, {
         logger(message) {
-          if (message.status === "recognizing text" && state.currentOcrLabel) {
-            setStatus(`${state.currentOcrLabel}：OCR ${Math.round(message.progress * 100)}%`);
+          const label = state.currentOcrLabels[slot];
+          if (message.status === "recognizing text" && label) {
+            setStatus(`${label}：OCR ${Math.round(message.progress * 100)}%`);
           }
         }
       }))
       .catch(error => {
-        state.ocrWorkerPromise = null;
+        state.ocrWorkerPromises[slot] = null;
         throw new Error(`無法載入 OCR 引擎：${error.message || error}`);
       });
   }
-  return state.ocrWorkerPromise;
+  return state.ocrWorkerPromises[slot];
 }
 
 function releaseCanvas(canvas) {
@@ -293,20 +441,60 @@ function releaseCanvas(canvas) {
   canvas.remove();
 }
 
-async function runOcrPass(page, label, profile) {
+function collectOcrWords(data) {
+  if (Array.isArray(data?.words) && data.words.length) return data.words;
+  const words = [];
+  for (const block of data?.blocks || []) {
+    for (const paragraph of block.paragraphs || []) {
+      for (const line of paragraph.lines || []) {
+        words.push(...(line.words || []));
+      }
+    }
+  }
+  return words;
+}
+
+function normalizeOcrWordBoxes(data, canvas) {
+  if (!canvas.width || !canvas.height) return [];
+  return collectOcrWords(data).flatMap(word => {
+    const box = word?.bbox;
+    const text = normalizeSpace(word?.text);
+    if (!text || !box) return [];
+    const x0 = Math.max(0, Math.min(canvas.width, Number(box.x0) || 0));
+    const y0 = Math.max(0, Math.min(canvas.height, Number(box.y0) || 0));
+    const x1 = Math.max(x0, Math.min(canvas.width, Number(box.x1) || 0));
+    const y1 = Math.max(y0, Math.min(canvas.height, Number(box.y1) || 0));
+    if (x1 <= x0 || y1 <= y0) return [];
+    return [{
+      text,
+      x: x0 / canvas.width,
+      y: y0 / canvas.height,
+      width: (x1 - x0) / canvas.width,
+      height: (y1 - y0) / canvas.height
+    }];
+  });
+}
+
+async function runOcrPass(page, label, profile, slot = 0) {
   setStatus(`${label}：準備${profile.name}辨識…`);
   const { canvas, scale } = await renderPageForOcr(page, profile);
-  state.currentOcrLabel = `${label}（${profile.name}）`;
+  if (isLikelyBlankCanvas(canvas)) {
+    releaseCanvas(canvas);
+    return { text: "", confidence: null, words: [], scale, blank: true };
+  }
+  state.currentOcrLabels[slot] = `${label}（${profile.name}）`;
   try {
-    const worker = await getOcrWorker();
+    const worker = await getOcrWorker(slot);
     const { data } = await worker.recognize(canvas);
     return {
       text: normalizeSpace(data.text),
       confidence: Number.isFinite(data.confidence) ? Math.round(data.confidence) : null,
-      scale
+      words: normalizeOcrWordBoxes(data, canvas),
+      scale,
+      blank: false
     };
   } finally {
-    state.currentOcrLabel = "";
+    state.currentOcrLabels[slot] = "";
     releaseCanvas(canvas);
   }
 }
@@ -315,10 +503,11 @@ function usefulCharacterCount(text) {
   return searchableCharacterCount(text);
 }
 
-function shouldRetryOcr(result) {
+function shouldRetryOcr(result, mode) {
+  if (result.blank || mode.retryConfidence === null) return false;
   return usefulCharacterCount(result.text) < 8
     || !Number.isFinite(result.confidence)
-    || result.confidence < OCR_RETRY_CONFIDENCE;
+    || result.confidence < mode.retryConfidence;
 }
 
 function ocrResultScore(result) {
@@ -326,8 +515,8 @@ function ocrResultScore(result) {
   return confidence + Math.min(usefulCharacterCount(result.text), 200) / 4;
 }
 
-async function recognizePage(page, label) {
-  const fastResult = await runOcrPass(page, label, OCR_FAST_PROFILE);
+async function recognizePage(page, label, mode, slot = 0) {
+  const fastResult = await runOcrPass(page, label, mode.fastProfile, slot);
   const detailScale = getAdaptiveOcrScale(
     page,
     OCR_DETAIL_PROFILE.maxPixels,
@@ -335,12 +524,12 @@ async function recognizePage(page, label) {
     OCR_DETAIL_PROFILE.maxEdge
   );
 
-  if (!shouldRetryOcr(fastResult) || detailScale <= fastResult.scale * 1.05) {
+  if (!shouldRetryOcr(fastResult, mode) || detailScale <= fastResult.scale * 1.05) {
     return { ...fastResult, refined: false, selectedPass: "fast" };
   }
 
   await waitWhilePaused(`${label}，等待精細辨識`);
-  const detailResult = await runOcrPass(page, label, OCR_DETAIL_PROFILE);
+  const detailResult = await runOcrPass(page, label, OCR_DETAIL_PROFILE, slot);
   const selected = ocrResultScore(detailResult) >= ocrResultScore(fastResult)
     ? { ...detailResult, selectedPass: "detail" }
     : { ...fastResult, selectedPass: "fast" };
@@ -348,12 +537,11 @@ async function recognizePage(page, label) {
 }
 
 async function recognizePageDetailed(page, label) {
-  const result = await runOcrPass(page, label, OCR_DETAIL_PROFILE);
+  const result = await runOcrPass(page, label, OCR_DETAIL_PROFILE, 0);
   return { ...result, refined: true, selectedPass: "detail" };
 }
 
-function calculateMetrics(pages) {
-  const totalPages = pages.length;
+function calculateMetrics(pages, totalPages = pages.length) {
   const recognizedPages = pages.filter(page => hasUsefulText(page.searchText || page.text)).length;
   const ocrPages = pages.filter(page => page.method === "ocr" || page.method === "hybrid");
   const confidences = ocrPages
@@ -373,6 +561,7 @@ function calculateMetrics(pages) {
 
   return {
     totalPages,
+    processedPages: pages.length,
     recognizedPages,
     recognitionRate: totalPages ? Math.round(recognizedPages / totalPages * 100) : 0,
     textLayerPages: pages.filter(page => page.method === "text-layer").length,
@@ -385,80 +574,124 @@ function calculateMetrics(pages) {
   };
 }
 
-async function extractPdf(file, fileId, displayPath) {
+async function extractPdfPage(pdf, fileId, displayPath, pageNumber, totalPages, mode, slot) {
+  setStatus(`建立索引中：${displayPath}（第 ${pageNumber}/${totalPages} 頁）`);
+  const page = await pdf.getPage(pageNumber);
+  try {
+    const textLayerText = extractTextItems(await page.getTextContent());
+    const quality = assessTextLayerQuality(textLayerText);
+    let text = textLayerText;
+    let searchText = textLayerText;
+    let ocrText = "";
+    let method = "text-layer";
+    let confidence = null;
+    let refined = false;
+    let selectedPass = null;
+    let ocrWords = [];
+
+    if (quality.needsOcr) {
+      const qualityReason = quality.flags
+        .map(flag => TEXT_QUALITY_LABELS[flag] || flag)
+        .join("、");
+      const result = await recognizePage(
+        page,
+        `${displayPath} 第 ${pageNumber} 頁（${qualityReason}）`,
+        mode,
+        slot
+      );
+      ocrText = result.text;
+      confidence = result.confidence;
+      ocrWords = result.words || [];
+      refined = result.refined;
+      selectedPass = result.selectedPass;
+      method = quality.hasUsableText ? "hybrid" : "ocr";
+      const merged = mergeRecognizedTexts(textLayerText, ocrText);
+      text = merged.primaryText;
+      searchText = merged.searchText;
+    }
+
+    return {
+      id: `${fileId}::${pageNumber}`,
+      fileId,
+      page: pageNumber,
+      text,
+      searchText,
+      textLayerText,
+      ocrText,
+      ocrWords,
+      method,
+      confidence,
+      qualityFlags: quality.flags,
+      refined,
+      selectedPass
+    };
+  } finally {
+    page.cleanup();
+  }
+}
+
+async function extractPdf(file, fileId, displayPath, options = {}) {
   const pdfjs = globalThis.pdfjsLib;
   if (!pdfjs?.getDocument) throw new Error("PDF.js 尚未完成載入");
 
   const loadingTask = pdfjs.getDocument({ data: await file.arrayBuffer() });
   const pdf = await loadingTask.promise;
-  const pages = [];
+  const totalPages = pdf.numPages;
+  const mode = options.mode || OCR_MODES.balanced;
+  const pages = [...(options.existingPages || [])];
+  const existingPageNumbers = new Set(pages.map(page => page.page));
+  const pendingPageNumbers = Array.from(
+    { length: totalPages },
+    (_, index) => index + 1
+  ).filter(pageNumber => !existingPageNumbers.has(pageNumber));
+  let nextPageIndex = 0;
+  let persistenceQueue = Promise.resolve();
 
   try {
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      await waitWhilePaused(`${displayPath} 第 ${pageNumber}/${pdf.numPages} 頁`);
-      setStatus(`建立索引中：${displayPath}（第 ${pageNumber}/${pdf.numPages} 頁）`);
-      const page = await pdf.getPage(pageNumber);
-      try {
-        const textLayerText = extractTextItems(await page.getTextContent());
-        const quality = assessTextLayerQuality(textLayerText);
-        let text = textLayerText;
-        let searchText = textLayerText;
-        let ocrText = "";
-        let method = "text-layer";
-        let confidence = null;
-        let refined = false;
-        let selectedPass = null;
-
-        if (quality.needsOcr) {
-          const qualityReason = quality.flags
-            .map(flag => TEXT_QUALITY_LABELS[flag] || flag)
-            .join("、");
-          const result = await recognizePage(
-            page,
-            `${displayPath} 第 ${pageNumber} 頁（${qualityReason}）`
-          );
-          ocrText = result.text;
-          confidence = result.confidence;
-          refined = result.refined;
-          selectedPass = result.selectedPass;
-          method = quality.hasUsableText ? "hybrid" : "ocr";
-          const merged = mergeRecognizedTexts(textLayerText, ocrText);
-          text = merged.primaryText;
-          searchText = merged.searchText;
-        }
-
-        pages.push({
-          id: `${fileId}::${pageNumber}`,
+    async function runWorker(slot) {
+      while (true) {
+        await waitWhilePaused(`${displayPath}，等待第 ${nextPageIndex + 1} 個索引工作`);
+        const pageNumber = pendingPageNumbers[nextPageIndex];
+        nextPageIndex += 1;
+        if (!pageNumber) return;
+        const indexedPage = await extractPdfPage(
+          pdf,
           fileId,
-          page: pageNumber,
-          text,
-          searchText,
-          textLayerText,
-          ocrText,
-          method,
-          confidence,
-          qualityFlags: quality.flags,
-          refined,
-          selectedPass
-        });
-      } finally {
-        page.cleanup();
+          displayPath,
+          pageNumber,
+          totalPages,
+          mode,
+          slot
+        );
+        pages.push(indexedPage);
+        if (options.onPageIndexed) {
+          const pageSnapshot = [...pages].sort((left, right) => left.page - right.page);
+          persistenceQueue = persistenceQueue.then(() => (
+            options.onPageIndexed(indexedPage, pageSnapshot, totalPages)
+          ));
+          await persistenceQueue;
+        }
       }
     }
+    const workerCount = Math.max(1, Math.min(mode.concurrency, pendingPageNumbers.length || 1));
+    await Promise.all(Array.from({ length: workerCount }, (_, slot) => runWorker(slot)));
+    await persistenceQueue;
   } finally {
     await pdf.destroy();
   }
 
-  return { pages, metrics: calculateMetrics(pages) };
+  pages.sort((left, right) => left.page - right.page);
+  return { pages, metrics: calculateMetrics(pages, totalPages), totalPages };
 }
 
-function makeFileRecord(file, handle, path, metrics) {
+function makeFileRecord(file, handle, path, metrics, fingerprint = null) {
   return {
     id: path,
     name: file.name,
     path,
     size: file.size,
     lastModified: file.lastModified,
+    fingerprint,
     handle,
     indexedAt: Date.now(),
     ...metrics
@@ -476,7 +709,9 @@ async function indexFiles(items) {
   setIndexing(true, true);
   setProgress(0, pdfs.length);
   let succeeded = 0;
+  let skipped = 0;
   const failures = [];
+  const mode = selectedOcrMode();
 
   try {
     for (let index = 0; index < pdfs.length; index += 1) {
@@ -484,16 +719,70 @@ async function indexFiles(items) {
       const path = pdfs[index].path || file.webkitRelativePath || file.name;
       await waitWhilePaused(`${path}（第 ${index + 1}/${pdfs.length} 份）`);
       try {
-        const { pages, metrics } = await extractPdf(file, path, path);
-        const record = makeFileRecord(file, handle, path, metrics);
-        await replaceFileIndex(record, pages);
         state.fileSources.set(path, { file, handle });
+        setStatus(`檢查檔案是否需要更新：${path}`);
+        let fingerprint = null;
+        try {
+          fingerprint = await createFileFingerprint(file);
+        } catch (error) {
+          console.warn("無法建立檔案指紋，改用檔案時間判斷。", error);
+        }
+        const snapshot = await getFileIndexSnapshot(path);
+        const matchesExisting = fileMatchesIndex(file, fingerprint, snapshot.record);
+        const existingPages = matchesExisting ? snapshot.pages : [];
+        const indexedPageNumbers = new Set(existingPages.map(page => page.page));
+        const complete = matchesExisting
+          && snapshot.record.totalPages > 0
+          && indexedPageNumbers.size >= snapshot.record.totalPages
+          && Array.from(
+            { length: snapshot.record.totalPages },
+            (_, pageIndex) => indexedPageNumbers.has(pageIndex + 1)
+          ).every(Boolean);
+        if (complete) {
+          skipped += 1;
+          setStatus(`未修改，沿用既有索引：${path}`);
+          await refreshCache();
+          continue;
+        }
+
+        let partialIndexStarted = existingPages.length > 0;
+        const resumeText = partialIndexStarted
+          ? `（續跑，已完成 ${existingPages.length} 頁）`
+          : "";
+        setStatus(`準備${mode.label}索引：${path}${resumeText}`);
+        const { metrics } = await extractPdf(file, path, path, {
+          mode,
+          existingPages,
+          onPageIndexed: async (page, processedPages, totalPages) => {
+            const partialMetrics = calculateMetrics(processedPages, totalPages);
+            const partialRecord = makeFileRecord(
+              file,
+              handle,
+              path,
+              partialMetrics,
+              fingerprint
+            );
+            if (!partialIndexStarted) {
+              await replaceFileIndex(partialRecord, [page]);
+              partialIndexStarted = true;
+            } else {
+              await upsertFileIndexPage(partialRecord, page);
+            }
+            setProgress(processedPages.length, totalPages);
+            await refreshCache();
+          }
+        });
+        const record = makeFileRecord(file, handle, path, metrics, fingerprint);
+        if (!partialIndexStarted) {
+          await replaceFileIndex(record, []);
+        } else {
+          await putFileRecord(record);
+        }
         succeeded += 1;
       } catch (error) {
         console.error(error);
         failures.push({ path, message: error.message || String(error) });
       }
-      setProgress(index + 1, pdfs.length);
       await refreshCache();
     }
   } finally {
@@ -502,9 +791,9 @@ async function indexFiles(items) {
   }
 
   if (failures.length) {
-    setStatus(`完成 ${succeeded} 份，失敗 ${failures.length} 份：${failures.map(item => item.path).join("、")}`);
+    setStatus(`完成 ${succeeded} 份，沿用 ${skipped} 份，失敗 ${failures.length} 份：${failures.map(item => item.path).join("、")}`);
   } else {
-    setStatus(`索引完成：${succeeded} 份 PDF。OCR 信心為估計值，並非人工校對準確率。`);
+    setStatus(`索引完成：新增或續跑 ${succeeded} 份，沿用未修改 ${skipped} 份（${mode.label}模式）。`);
   }
 }
 
@@ -552,6 +841,9 @@ function fileMetricText(file) {
   const parts = [
     `可搜尋 ${file.recognizedPages}/${file.totalPages} 頁（${file.recognitionRate}%）`
   ];
+  if (Number.isFinite(file.processedPages) && file.processedPages < file.totalPages) {
+    parts.unshift(`處理進度 ${file.processedPages}/${file.totalPages} 頁`);
+  }
   if (file.ocrPages) {
     parts.push(`含 OCR ${file.ocrPages} 頁`);
     if (file.hybridPages) parts.push(`混合辨識 ${file.hybridPages} 頁`);
@@ -816,6 +1108,7 @@ const SEARCH_TIER_DETAILS = {
 
 function runSearch() {
   const terms = parseSearchTerms(els.search.value);
+  state.currentSearchTerms = terms;
   if (!terms.length) {
     els.results.innerHTML = state.indexedPages.length
       ? `<div class="empty-results">已索引 ${state.indexedPages.length} 頁，輸入文字開始搜尋。</div>`
@@ -873,7 +1166,7 @@ function runSearch() {
           <span class="result-match-badge result-match-badge--${evaluation.tier}">${tier.label}</span>
           相似度 ${evaluation.score}% · 第 ${page.page} 頁${source}${confidence}${refined}${compound}${qualityNote}
         </div>
-        <div class="result-snippet">${makeSnippet(page.searchText, evaluation.termMatches)}</div>
+        <div class="result-snippet">${makeSnippet(page.searchCorpus, evaluation.termMatches)}</div>
       </button>
     `;
   }).join("");
@@ -882,6 +1175,7 @@ function runSearch() {
 async function refreshCache() {
   const [files, pages] = await Promise.all([getAll(FILE_STORE), getAll(PAGE_STORE)]);
   state.indexedFiles = files.sort((a, b) => (a.path || a.name).localeCompare(b.path || b.name));
+  const filesById = new Map(state.indexedFiles.map(file => [file.id, file]));
   state.indexedPages = pages.map(page => {
     const text = normalizeSpace(page.text);
     const searchText = normalizeSpace(page.searchText || text);
@@ -889,21 +1183,34 @@ async function refreshCache() {
       || (page.method === "text-layer" ? text : ""));
     const ocrText = normalizeSpace(page.ocrText
       || (page.method === "ocr" ? text : ""));
+    const file = filesById.get(page.fileId);
+    const filePath = page.page === 1
+      ? file?.path || file?.name || page.fileId
+      : "";
+    const searchCorpus = combineSearchSources(
+      filePath,
+      page.searchText,
+      page.text,
+      page.textLayerText,
+      page.ocrText
+    );
     return {
       ...page,
       text,
       searchText,
+      searchCorpus,
       textLayerText,
       ocrText,
+      ocrWords: Array.isArray(page.ocrWords) ? page.ocrWords : [],
       qualityFlags: Array.isArray(page.qualityFlags) ? page.qualityFlags : [],
       refined: Boolean(page.refined),
-      searchDocument: buildSearchDocument(searchText)
+      searchDocument: buildSearchDocument(searchCorpus)
     };
   });
   const recognizedPages = state.indexedPages.filter(page => hasUsefulText(page.searchText)).length;
   const hybridPages = state.indexedPages.filter(page => page.method === "hybrid").length;
   const qualitySummary = hybridPages ? `，${hybridPages} 頁採文字層＋OCR 混合辨識` : "";
-  els.summary.textContent = `已索引 ${files.length} 份 PDF、${pages.length} 頁，其中 ${recognizedPages} 頁可搜尋${qualitySummary}。`;
+  els.summary.textContent = `索引庫：${files.length} 份 PDF，共 ${pages.length} 頁；其中 ${recognizedPages} 頁可搜尋${qualitySummary}。`;
   els.exportBtn.disabled = state.indexing || !pages.length;
   renderFileNotes();
   renderQualityAudit();
@@ -951,8 +1258,178 @@ async function waitForCondition(check, timeoutMs, message) {
   throw new Error(message);
 }
 
-async function openResult(fileId, pageNumber) {
+function clearPdfHighlights() {
+  state.highlightToken += 1;
+  els.readerHighlightLayer.replaceChildren();
+  els.readerHighlightLayer.hidden = true;
+}
+
+function wordMatchesAnyTerm(text, terms) {
+  const normalizedWord = normalizeSearchText(text);
+  if (!normalizedWord) return false;
+  return terms.some(term => {
+    const normalizedTerm = normalizeSearchText(term);
+    return normalizedTerm && (
+      normalizedWord.includes(normalizedTerm)
+      || (normalizedTerm.length > 1 && normalizedTerm.includes(normalizedWord))
+    );
+  });
+}
+
+function matchingOcrBoxes(words, terms) {
+  return (words || [])
+    .filter(word => wordMatchesAnyTerm(word.text, terms))
+    .map(word => ({
+      x: word.x,
+      y: word.y,
+      width: word.width,
+      height: word.height
+    }));
+}
+
+async function textLayerHighlightBoxes(pageNumber, terms) {
+  if (!state.readerPreviewPdf || !terms.length) return [];
+  const page = await state.readerPreviewPdf.getPage(pageNumber);
   try {
+    const viewport = page.getViewport({ scale: 1 });
+    const textContent = await page.getTextContent();
+    const util = globalThis.pdfjsLib?.Util;
+    if (!util?.transform || !viewport.width || !viewport.height) return [];
+    const boxes = [];
+    for (const item of textContent.items || []) {
+      if (typeof item.str !== "string" || !item.str.trim()) continue;
+      const rawText = item.str;
+      const rawLower = rawText.toLocaleLowerCase();
+      const transform = util.transform(viewport.transform, item.transform);
+      const height = Math.max(2, Math.hypot(transform[2], transform[3]));
+      const fullWidth = Math.max(2, Math.abs((Number(item.width) || 0) * viewport.scale));
+      for (const term of terms) {
+        const termLower = term.toLocaleLowerCase();
+        const exactIndex = rawLower.indexOf(termLower);
+        const normalizedMatch = exactIndex < 0
+          && normalizeSearchText(rawText).includes(normalizeSearchText(term));
+        if (exactIndex < 0 && !normalizedMatch) continue;
+        const startRatio = exactIndex >= 0 ? exactIndex / Math.max(rawText.length, 1) : 0;
+        const widthRatio = exactIndex >= 0
+          ? Math.max(term.length / Math.max(rawText.length, 1), 0.04)
+          : 1;
+        boxes.push({
+          x: (transform[4] + fullWidth * startRatio) / viewport.width,
+          y: (transform[5] - height) / viewport.height,
+          width: Math.min(fullWidth * widthRatio, fullWidth) / viewport.width,
+          height: height / viewport.height
+        });
+      }
+    }
+    return boxes;
+  } finally {
+    page.cleanup();
+  }
+}
+
+function renderPdfHighlightBoxes(boxes) {
+  const canvas = els.readerPrimaryCanvas;
+  const layer = els.readerHighlightLayer;
+  if (!boxes.length || canvas.hidden || !canvas.offsetWidth || !canvas.offsetHeight) {
+    layer.replaceChildren();
+    layer.hidden = true;
+    return;
+  }
+  layer.style.left = `${canvas.offsetLeft}px`;
+  layer.style.top = `${canvas.offsetTop}px`;
+  layer.style.width = `${canvas.offsetWidth}px`;
+  layer.style.height = `${canvas.offsetHeight}px`;
+  layer.replaceChildren(...boxes.map(box => {
+    const mark = document.createElement("span");
+    mark.className = "pdf-highlight";
+    mark.style.left = `${Math.max(0, box.x) * 100}%`;
+    mark.style.top = `${Math.max(0, box.y) * 100}%`;
+    mark.style.width = `${Math.max(0.004, Math.min(1 - box.x, box.width)) * 100}%`;
+    mark.style.height = `${Math.max(0.004, Math.min(1 - box.y, box.height)) * 100}%`;
+    return mark;
+  }));
+  layer.hidden = false;
+}
+
+async function locatePdfHighlights(fileId, pageNumber, terms, options = {}) {
+  const token = ++state.highlightToken;
+  state.activeHighlight = { fileId, pageNumber, terms: [...terms] };
+  els.readerHighlightLayer.replaceChildren();
+  els.readerHighlightLayer.hidden = true;
+  if (!terms.length || !state.readerPreviewPdf) return 0;
+
+  const indexedPage = state.indexedPages.find(page => (
+    page.fileId === fileId && page.page === pageNumber
+  ));
+  let boxes = await textLayerHighlightBoxes(pageNumber, terms);
+  if (token !== state.highlightToken) return 0;
+  boxes.push(...matchingOcrBoxes(indexedPage?.ocrWords, terms));
+
+  const pageTextHasTerm = terms.some(term => (
+    normalizeSearchText(indexedPage?.searchText || indexedPage?.text)
+      .includes(normalizeSearchText(term))
+  ));
+  if (!boxes.length && pageTextHasTerm && indexedPage
+      && !state.indexing && !state.reviewingPageId && !options.skipOnDemandOcr) {
+    els.readerStatus.textContent = `正在定位「${terms.join("、")}」…`;
+    const pdfPage = await state.readerPreviewPdf.getPage(pageNumber);
+    try {
+      const result = await runOcrPass(
+        pdfPage,
+        `定位第 ${pageNumber} 頁`,
+        OCR_MODES.quick.fastProfile,
+        0
+      );
+      if (token !== state.highlightToken) return 0;
+      indexedPage.ocrWords = result.words || [];
+      boxes.push(...matchingOcrBoxes(indexedPage.ocrWords, terms));
+      if (indexedPage.ocrWords.length) {
+        putPageRecord(toStoredPage(indexedPage)).catch(error => {
+          console.warn("無法保存關鍵字定位資料", error);
+        });
+      }
+    } finally {
+      pdfPage.cleanup();
+    }
+  }
+
+  if (token !== state.highlightToken) return 0;
+  state.activeHighlight = {
+    fileId,
+    pageNumber,
+    terms: [...terms],
+    boxes: boxes.map(box => ({ ...box }))
+  };
+  renderPdfHighlightBoxes(boxes);
+  return boxes.length;
+}
+
+function schedulePdfHighlightRefresh(delay = 140) {
+  const active = state.activeHighlight;
+  if (!active) return;
+  const expectedPage = active.pageNumber;
+  setTimeout(() => {
+    if (!state.activeHighlight || state.activeHighlight.pageNumber !== expectedPage) return;
+    if (Number(els.readerPageInput.value) !== expectedPage) {
+      clearPdfHighlights();
+      state.activeHighlight = null;
+      return;
+    }
+    renderPdfHighlightBoxes(state.activeHighlight.boxes || []);
+  }, delay);
+}
+
+function clearHighlightWhenPageChanged() {
+  if (!state.activeHighlight) return;
+  if (Number(els.readerPageInput.value) === state.activeHighlight.pageNumber) return;
+  clearPdfHighlights();
+  state.activeHighlight = null;
+}
+
+async function openResult(fileId, pageNumber, terms = state.currentSearchTerms) {
+  try {
+    clearPdfHighlights();
+    state.activeHighlight = null;
     const file = await getFileForResult(fileId);
     const transfer = new DataTransfer();
     transfer.items.add(file);
@@ -961,6 +1438,11 @@ async function openResult(fileId, pageNumber) {
     els.readerText.value = "";
     els.readerFileInput.files = transfer.files;
     els.readerFileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitForCondition(
+      () => state.readerPreviewFileName === file.name && state.readerPreviewPdf,
+      30000,
+      `無法準備 PDF 關鍵字定位：${file.name}`
+    );
     await waitForCondition(() => readerIsIdle(file.name), 30000, `無法載入：${file.name}`);
 
     if (pageNumber > 1) {
@@ -988,6 +1470,14 @@ async function openResult(fileId, pageNumber) {
       const quality = pageQualityText(indexedPage);
       const qualityNote = quality ? `；品質提醒：${quality}` : "";
       els.readerStatus.textContent = `已套用批次索引文字（${source}${confidence}${qualityNote}）`;
+    }
+    const highlightCount = await locatePdfHighlights(fileId, pageNumber, terms);
+    if (highlightCount) {
+      els.readerStatus.textContent = `第 ${pageNumber} 頁，已高亮 ${highlightCount} 處關鍵字`;
+    } else if (terms.length) {
+      els.readerStatus.textContent = pageNumber === 1
+        ? "此結果可能命中檔名；頁面內沒有可高亮文字"
+        : "已跳到命中頁；目前無法取得文字位置";
     }
   } catch (error) {
     console.error(error);
@@ -1039,6 +1529,7 @@ async function reRecognizeIndexedPage(fileId, pageNumber) {
       searchText: merged.searchText,
       textLayerText,
       ocrText: combinedOcrText,
+      ocrWords: ocrResult.words || existingPage.ocrWords || [],
       method: quality.hasUsableText ? "hybrid" : "ocr",
       confidence: ocrResult.confidence,
       qualityFlags: quality.flags,
@@ -1069,6 +1560,82 @@ async function reRecognizeIndexedPage(fileId, pageNumber) {
   }
 }
 
+function readerPreviewScale() {
+  const percent = Number.parseInt(els.readerZoomLevel.textContent, 10);
+  return Number.isFinite(percent) ? percent / 100 : 1.2;
+}
+
+async function renderSecondaryPreview() {
+  const token = ++state.readerPreviewToken;
+  const spread = els.readerPageLayout.value === "spread";
+  const currentPage = Number.parseInt(els.readerPageInput.value, 10) || 1;
+  const hasSecondPage = spread
+    && state.readerPreviewPdf
+    && currentPage > 1;
+  els.readerViewer.classList.toggle("viewer--two-page", Boolean(hasSecondPage));
+  if (!hasSecondPage) {
+    els.readerSecondaryCanvas.hidden = true;
+    schedulePdfHighlightRefresh();
+    return;
+  }
+
+  const page = await state.readerPreviewPdf.getPage(currentPage - 1);
+  const renderCanvas = document.createElement("canvas");
+  try {
+    const viewport = page.getViewport({ scale: readerPreviewScale() });
+    const outputScale = window.devicePixelRatio || 1;
+    renderCanvas.width = Math.floor(viewport.width * outputScale);
+    renderCanvas.height = Math.floor(viewport.height * outputScale);
+    await page.render({
+      canvasContext: renderCanvas.getContext("2d", { alpha: false }),
+      viewport,
+      transform: outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : undefined
+    }).promise;
+    if (token !== state.readerPreviewToken) return;
+    els.readerSecondaryCanvas.width = renderCanvas.width;
+    els.readerSecondaryCanvas.height = renderCanvas.height;
+    els.readerSecondaryCanvas.style.width = `${Math.floor(viewport.width)}px`;
+    els.readerSecondaryCanvas.style.height = `${Math.floor(viewport.height)}px`;
+    els.readerSecondaryCanvas
+      .getContext("2d", { alpha: false })
+      .drawImage(renderCanvas, 0, 0);
+    els.readerSecondaryCanvas.hidden = false;
+    schedulePdfHighlightRefresh();
+  } finally {
+    renderCanvas.width = 1;
+    renderCanvas.height = 1;
+    page.cleanup();
+  }
+}
+
+async function loadReaderPreviewPdf(file) {
+  if (!file || !(/\.pdf$/i.test(file.name) || file.type === "application/pdf")) return;
+  state.readerPreviewFileName = "";
+  const token = ++state.readerPreviewToken;
+  const pdfjs = globalThis.pdfjsLib;
+  if (!pdfjs?.getDocument) return;
+  const previewPdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  if (token !== state.readerPreviewToken) {
+    await previewPdf.destroy();
+    return;
+  }
+  if (state.readerPreviewPdf) await state.readerPreviewPdf.destroy();
+  state.readerPreviewPdf = previewPdf;
+  state.readerPreviewFileName = file.name;
+  await renderSecondaryPreview();
+}
+
+function moveReaderSpread(delta, event) {
+  if (els.readerPageLayout.value !== "spread" || !state.readerPreviewPdf) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  const currentPage = Number.parseInt(els.readerPageInput.value, 10) || 1;
+  const totalPages = Number.parseInt(els.readerPageCount.textContent, 10) || 1;
+  const nextPage = Math.min(totalPages, Math.max(1, currentPage + delta));
+  els.readerPageInput.value = String(nextPage);
+  els.readerPageInput.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 let resizingBatchPanel = false;
 
 function resizeBatchPanel(clientX) {
@@ -1096,6 +1663,7 @@ window.addEventListener("mouseup", () => {
   if (!resizingBatchPanel) return;
   resizingBatchPanel = false;
   document.body.classList.remove("is-resizing-panels");
+  schedulePdfHighlightRefresh();
 });
 
 async function exportText() {
@@ -1149,11 +1717,65 @@ els.pickFolderBtn.addEventListener("click", () => pickFolder().catch(error => {
 els.fileInput.addEventListener("change", event => {
   const files = Array.from(event.target.files || []).map(file => ({ file }));
   event.target.value = "";
+  if (files.length) {
+    setStatus(`已選取 ${files.length} 份 PDF，準備建立索引…`);
+  }
   indexFiles(files).catch(error => {
     console.error(error);
     setStatus(error.message || String(error));
   });
 });
+
+els.readerFileInput.addEventListener("change", event => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  clearPdfHighlights();
+  state.activeHighlight = null;
+  loadReaderPreviewPdf(file).catch(error => console.error("無法準備雙頁預覽", error));
+}, { capture: true });
+
+els.readerViewer.addEventListener("drop", event => {
+  const file = event.dataTransfer?.files?.[0];
+  if (!file) return;
+  loadReaderPreviewPdf(file).catch(error => console.error("無法準備雙頁預覽", error));
+});
+
+els.readerPageLayout.addEventListener("change", () => {
+  schedulePdfHighlightRefresh();
+  renderSecondaryPreview().catch(error => console.error("無法切換雙頁預覽", error));
+});
+
+els.readerPageInput.addEventListener("change", () => {
+  schedulePdfHighlightRefresh();
+  renderSecondaryPreview().catch(error => console.error("無法更新雙頁預覽", error));
+});
+els.readerPageInput.addEventListener("input", clearHighlightWhenPageChanged);
+
+els.readerPrevBtn.addEventListener("click", event => moveReaderSpread(-2, event), true);
+els.readerNextBtn.addEventListener("click", event => moveReaderSpread(2, event), true);
+for (const pageButton of [els.readerPrevBtn, els.readerNextBtn]) {
+  pageButton.addEventListener("click", () => setTimeout(clearHighlightWhenPageChanged, 0));
+}
+
+for (const zoomButton of [els.readerZoomInBtn, els.readerZoomOutBtn]) {
+  zoomButton.addEventListener("click", () => {
+    setTimeout(() => {
+      renderSecondaryPreview().catch(error => console.error("無法更新雙頁縮放", error));
+      schedulePdfHighlightRefresh(120);
+    }, 100);
+  });
+}
+
+document.addEventListener("keydown", event => {
+  if (els.readerPageLayout.value !== "spread" || !state.readerPreviewPdf) return;
+  if (event.target === els.readerPageInput || event.target === els.readerText) return;
+  if (event.key === "ArrowLeft" || event.key === "PageUp") {
+    moveReaderSpread(-2, event);
+  } else if (event.key === "ArrowRight" || event.key === "PageDown") {
+    moveReaderSpread(2, event);
+  }
+}, true);
+document.addEventListener("keyup", clearHighlightWhenPageChanged);
 
 els.clearBtn.addEventListener("click", () => clearIndex().catch(error => {
   console.error(error);
@@ -1169,6 +1791,14 @@ els.search.addEventListener("input", () => {
 els.search.addEventListener("keydown", event => event.stopPropagation());
 els.searchMode.addEventListener("change", runSearch);
 els.searchMode.addEventListener("keydown", event => event.stopPropagation());
+els.ocrMode.addEventListener("change", () => {
+  try {
+    localStorage.setItem(OCR_MODE_STORAGE_KEY, els.ocrMode.value);
+  } catch {
+    // The selected mode still applies for this session.
+  }
+});
+els.ocrMode.addEventListener("keydown", event => event.stopPropagation());
 
 for (const tab of els.batchTabs) {
   tab.addEventListener("click", () => setBatchTab(tab.dataset.batchTab));
@@ -1200,7 +1830,7 @@ els.auditList.addEventListener("click", event => {
   const fileId = button.dataset.fileId;
   const pageNumber = Number(button.dataset.page);
   if (button.dataset.auditAction === "open") {
-    openResult(fileId, pageNumber);
+    openResult(fileId, pageNumber, []);
   } else if (button.dataset.auditAction === "reocr") {
     reRecognizeIndexedPage(fileId, pageNumber).catch(error => {
       console.error(error);
@@ -1213,13 +1843,22 @@ els.exportReviewBtn.addEventListener("click", exportReviewList);
 
 els.results.addEventListener("click", event => {
   const item = event.target.closest(".result-item");
-  if (item) openResult(item.dataset.fileId, Number(item.dataset.page));
+  if (item) openResult(item.dataset.fileId, Number(item.dataset.page), state.currentSearchTerms);
 });
+
+window.addEventListener("resize", () => schedulePdfHighlightRefresh());
 
 els.exportBtn.addEventListener("click", () => exportText().catch(error => {
   console.error(error);
   setStatus(error.message || String(error));
 }));
+
+try {
+  const storedOcrMode = localStorage.getItem(OCR_MODE_STORAGE_KEY);
+  if (OCR_MODES[storedOcrMode]) els.ocrMode.value = storedOcrMode;
+} catch {
+  // Use the default balanced mode when storage is unavailable.
+}
 
 openDb()
   .then(refreshCache)
