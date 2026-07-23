@@ -3,6 +3,13 @@ import {
   evaluatePageSearch,
   normalizeSearchText
 } from "./search-utils.mjs";
+import {
+  assessTextLayerQuality,
+  classifyAuditIssues,
+  mergeRecognizedTexts,
+  searchableCharacterCount,
+  TEXT_QUALITY_LABELS
+} from "./recognition-utils.mjs";
 
 const DB_NAME = "pdf-reader-batch-index-v2";
 const DB_VERSION = 1;
@@ -16,7 +23,20 @@ const OCR_FAST_MAX_SCALE = 1.8;
 const OCR_DETAIL_MAX_SCALE = 2.5;
 const OCR_FAST_MAX_EDGE = 4096;
 const OCR_DETAIL_MAX_EDGE = 6144;
+const OCR_FAST_PROFILE = {
+  name: "快速",
+  maxPixels: OCR_FAST_MAX_PIXELS,
+  maxScale: OCR_FAST_MAX_SCALE,
+  maxEdge: OCR_FAST_MAX_EDGE
+};
+const OCR_DETAIL_PROFILE = {
+  name: "精細",
+  maxPixels: OCR_DETAIL_MAX_PIXELS,
+  maxScale: OCR_DETAIL_MAX_SCALE,
+  maxEdge: OCR_DETAIL_MAX_EDGE
+};
 const SEARCH_RESULT_LIMIT = 100;
+const AUDIT_DISPLAY_LIMIT = 200;
 const SEARCH_DEBOUNCE_MS = 160;
 const TESSERACT_MODULE_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/+esm";
 const CJK_CHARACTERS = "\\u3000-\\u303f\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff00-\\uffef";
@@ -33,12 +53,19 @@ const els = {
   clearBtn: document.getElementById("clear-index-btn"),
   status: document.getElementById("batch-status"),
   progress: document.getElementById("batch-progress"),
+  pauseBtn: document.getElementById("pause-index-btn"),
   search: document.getElementById("search-input"),
   searchMode: document.getElementById("search-mode"),
   results: document.getElementById("search-results"),
   summary: document.getElementById("index-summary"),
   files: document.getElementById("index-files"),
   exportBtn: document.getElementById("export-text-btn"),
+  auditCount: document.getElementById("audit-count"),
+  auditFilter: document.getElementById("audit-filter"),
+  auditList: document.getElementById("audit-list"),
+  exportReviewBtn: document.getElementById("export-review-btn"),
+  batchTabs: Array.from(document.querySelectorAll("[data-batch-tab]")),
+  batchPanels: Array.from(document.querySelectorAll("[data-batch-panel]")),
   readerFileInput: document.getElementById("file-input"),
   readerFileName: document.getElementById("file-name"),
   readerPageInput: document.getElementById("page-input"),
@@ -60,7 +87,12 @@ const state = {
   indexedPages: [],
   searchTimer: null,
   ocrWorkerPromise: null,
-  currentOcrLabel: ""
+  currentOcrLabel: "",
+  reviewingPageId: null,
+  pauseAvailable: false,
+  pauseRequested: false,
+  paused: false,
+  pauseResolvers: []
 };
 
 function setStatus(message) {
@@ -73,12 +105,57 @@ function setProgress(done, total) {
   els.progress.value = done;
 }
 
-function setIndexing(active) {
+function updatePauseButton() {
+  els.pauseBtn.disabled = !state.indexing || !state.pauseAvailable;
+  els.pauseBtn.textContent = state.pauseRequested ? "繼續" : "暫停";
+  els.pauseBtn.classList.toggle("btn--primary", state.pauseRequested);
+  els.pauseBtn.setAttribute("aria-pressed", String(state.pauseRequested));
+}
+
+function releasePauseWaiters() {
+  const resolvers = state.pauseResolvers.splice(0);
+  for (const resolve of resolvers) resolve();
+}
+
+function setIndexing(active, pauseAvailable = false) {
   state.indexing = active;
+  state.pauseAvailable = active && pauseAvailable;
+  if (!active) {
+    state.pauseRequested = false;
+    state.paused = false;
+    releasePauseWaiters();
+  }
   els.pickFolderBtn.disabled = active;
   els.fileInput.disabled = active;
   els.clearBtn.disabled = active;
   els.exportBtn.disabled = active || !state.indexedPages.length;
+  updatePauseButton();
+  renderQualityAudit();
+}
+
+function toggleIndexPause() {
+  if (!state.indexing || !state.pauseAvailable) return;
+  if (state.pauseRequested) {
+    state.pauseRequested = false;
+    state.paused = false;
+    releasePauseWaiters();
+    setStatus("正在繼續批次索引…");
+  } else {
+    state.pauseRequested = true;
+    setStatus("將在目前頁面辨識完成後暫停…");
+  }
+  updatePauseButton();
+}
+
+async function waitWhilePaused(label) {
+  if (!state.pauseAvailable || !state.pauseRequested) return;
+  state.paused = true;
+  updatePauseButton();
+  setStatus(`已暫停：${label}`);
+  await new Promise(resolve => state.pauseResolvers.push(resolve));
+  state.paused = false;
+  updatePauseButton();
+  if (state.indexing) setStatus(`繼續處理：${label}`);
 }
 
 function requestToPromise(request) {
@@ -158,7 +235,7 @@ function normalizeSpace(text) {
 }
 
 function hasUsefulText(text) {
-  return text.replace(/\s/g, "").length >= 3;
+  return searchableCharacterCount(text) >= 3;
 }
 
 function extractTextItems(content) {
@@ -235,7 +312,7 @@ async function runOcrPass(page, label, profile) {
 }
 
 function usefulCharacterCount(text) {
-  return String(text || "").replace(/\s/g, "").length;
+  return searchableCharacterCount(text);
 }
 
 function shouldRetryOcr(result) {
@@ -250,40 +327,35 @@ function ocrResultScore(result) {
 }
 
 async function recognizePage(page, label) {
-  const fastProfile = {
-    name: "快速",
-    maxPixels: OCR_FAST_MAX_PIXELS,
-    maxScale: OCR_FAST_MAX_SCALE,
-    maxEdge: OCR_FAST_MAX_EDGE
-  };
-  const detailProfile = {
-    name: "精細",
-    maxPixels: OCR_DETAIL_MAX_PIXELS,
-    maxScale: OCR_DETAIL_MAX_SCALE,
-    maxEdge: OCR_DETAIL_MAX_EDGE
-  };
-  const fastResult = await runOcrPass(page, label, fastProfile);
+  const fastResult = await runOcrPass(page, label, OCR_FAST_PROFILE);
   const detailScale = getAdaptiveOcrScale(
     page,
-    detailProfile.maxPixels,
-    detailProfile.maxScale,
-    detailProfile.maxEdge
+    OCR_DETAIL_PROFILE.maxPixels,
+    OCR_DETAIL_PROFILE.maxScale,
+    OCR_DETAIL_PROFILE.maxEdge
   );
 
   if (!shouldRetryOcr(fastResult) || detailScale <= fastResult.scale * 1.05) {
-    return fastResult;
+    return { ...fastResult, refined: false, selectedPass: "fast" };
   }
 
-  const detailResult = await runOcrPass(page, label, detailProfile);
-  return ocrResultScore(detailResult) >= ocrResultScore(fastResult)
-    ? detailResult
-    : fastResult;
+  await waitWhilePaused(`${label}，等待精細辨識`);
+  const detailResult = await runOcrPass(page, label, OCR_DETAIL_PROFILE);
+  const selected = ocrResultScore(detailResult) >= ocrResultScore(fastResult)
+    ? { ...detailResult, selectedPass: "detail" }
+    : { ...fastResult, selectedPass: "fast" };
+  return { ...selected, refined: true };
+}
+
+async function recognizePageDetailed(page, label) {
+  const result = await runOcrPass(page, label, OCR_DETAIL_PROFILE);
+  return { ...result, refined: true, selectedPass: "detail" };
 }
 
 function calculateMetrics(pages) {
   const totalPages = pages.length;
-  const recognizedPages = pages.filter(page => hasUsefulText(page.text)).length;
-  const ocrPages = pages.filter(page => page.method === "ocr");
+  const recognizedPages = pages.filter(page => hasUsefulText(page.searchText || page.text)).length;
+  const ocrPages = pages.filter(page => page.method === "ocr" || page.method === "hybrid");
   const confidences = ocrPages
     .map(page => page.confidence)
     .filter(Number.isFinite);
@@ -291,7 +363,12 @@ function calculateMetrics(pages) {
     ? Math.round(confidences.reduce((sum, value) => sum + value, 0) / confidences.length)
     : null;
   const lowConfidencePages = ocrPages
-    .filter(page => !hasUsefulText(page.text) || !Number.isFinite(page.confidence) || page.confidence < OCR_CONFIDENCE_WARNING)
+    .filter(page => !hasUsefulText(page.searchText || page.text)
+      || !Number.isFinite(page.confidence)
+      || page.confidence < OCR_CONFIDENCE_WARNING)
+    .map(page => page.page);
+  const suspiciousTextLayerPages = pages
+    .filter(page => page.method === "hybrid" && (page.qualityFlags || []).length)
     .map(page => page.page);
 
   return {
@@ -300,8 +377,11 @@ function calculateMetrics(pages) {
     recognitionRate: totalPages ? Math.round(recognizedPages / totalPages * 100) : 0,
     textLayerPages: pages.filter(page => page.method === "text-layer").length,
     ocrPages: ocrPages.length,
+    hybridPages: pages.filter(page => page.method === "hybrid").length,
+    refinedOcrPages: ocrPages.filter(page => page.refined).length,
     ocrAverageConfidence,
-    lowConfidencePages
+    lowConfidencePages,
+    suspiciousTextLayerPages
   };
 }
 
@@ -315,29 +395,55 @@ async function extractPdf(file, fileId, displayPath) {
 
   try {
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      await waitWhilePaused(`${displayPath} 第 ${pageNumber}/${pdf.numPages} 頁`);
       setStatus(`建立索引中：${displayPath}（第 ${pageNumber}/${pdf.numPages} 頁）`);
       const page = await pdf.getPage(pageNumber);
-      const textLayer = extractTextItems(await page.getTextContent());
-      let text = textLayer;
-      let method = "text-layer";
-      let confidence = null;
+      try {
+        const textLayerText = extractTextItems(await page.getTextContent());
+        const quality = assessTextLayerQuality(textLayerText);
+        let text = textLayerText;
+        let searchText = textLayerText;
+        let ocrText = "";
+        let method = "text-layer";
+        let confidence = null;
+        let refined = false;
+        let selectedPass = null;
 
-      if (!hasUsefulText(textLayer)) {
-        method = "ocr";
-        const result = await recognizePage(page, `${displayPath} 第 ${pageNumber} 頁`);
-        text = result.text;
-        confidence = result.confidence;
+        if (quality.needsOcr) {
+          const qualityReason = quality.flags
+            .map(flag => TEXT_QUALITY_LABELS[flag] || flag)
+            .join("、");
+          const result = await recognizePage(
+            page,
+            `${displayPath} 第 ${pageNumber} 頁（${qualityReason}）`
+          );
+          ocrText = result.text;
+          confidence = result.confidence;
+          refined = result.refined;
+          selectedPass = result.selectedPass;
+          method = quality.hasUsableText ? "hybrid" : "ocr";
+          const merged = mergeRecognizedTexts(textLayerText, ocrText);
+          text = merged.primaryText;
+          searchText = merged.searchText;
+        }
+
+        pages.push({
+          id: `${fileId}::${pageNumber}`,
+          fileId,
+          page: pageNumber,
+          text,
+          searchText,
+          textLayerText,
+          ocrText,
+          method,
+          confidence,
+          qualityFlags: quality.flags,
+          refined,
+          selectedPass
+        });
+      } finally {
+        page.cleanup();
       }
-
-      pages.push({
-        id: `${fileId}::${pageNumber}`,
-        fileId,
-        page: pageNumber,
-        text,
-        method,
-        confidence
-      });
-      page.cleanup();
     }
   } finally {
     await pdf.destroy();
@@ -367,7 +473,7 @@ async function indexFiles(items) {
     return;
   }
 
-  setIndexing(true);
+  setIndexing(true, true);
   setProgress(0, pdfs.length);
   let succeeded = 0;
   const failures = [];
@@ -376,6 +482,7 @@ async function indexFiles(items) {
     for (let index = 0; index < pdfs.length; index += 1) {
       const { file, handle = null } = pdfs[index];
       const path = pdfs[index].path || file.webkitRelativePath || file.name;
+      await waitWhilePaused(`${path}（第 ${index + 1}/${pdfs.length} 份）`);
       try {
         const { pages, metrics } = await extractPdf(file, path, path);
         const record = makeFileRecord(file, handle, path, metrics);
@@ -446,7 +553,9 @@ function fileMetricText(file) {
     `可搜尋 ${file.recognizedPages}/${file.totalPages} 頁（${file.recognitionRate}%）`
   ];
   if (file.ocrPages) {
-    parts.push(`OCR ${file.ocrPages} 頁`);
+    parts.push(`含 OCR ${file.ocrPages} 頁`);
+    if (file.hybridPages) parts.push(`混合辨識 ${file.hybridPages} 頁`);
+    if (file.refinedOcrPages) parts.push(`精細重辨 ${file.refinedOcrPages} 頁`);
     parts.push(Number.isFinite(file.ocrAverageConfidence)
       ? `平均信心 ${file.ocrAverageConfidence}%`
       : "無可用 OCR 信心");
@@ -455,6 +564,9 @@ function fileMetricText(file) {
   }
   if (file.lowConfidencePages?.length) {
     parts.push(`低信心／無文字：第 ${file.lowConfidencePages.join("、")} 頁`);
+  }
+  if (file.suspiciousTextLayerPages?.length) {
+    parts.push(`可疑文字層：第 ${file.suspiciousTextLayerPages.join("、")} 頁`);
   }
   return parts.join(" · ");
 }
@@ -465,15 +577,161 @@ function renderFileNotes() {
     return;
   }
   els.files.innerHTML = state.indexedFiles.map(file => {
-    const warning = file.lowConfidencePages?.length ? " file-index-item--warning" : "";
+    const warning = file.lowConfidencePages?.length || file.suspiciousTextLayerPages?.length
+      ? " file-index-item--warning"
+      : "";
     return `
       <div class="file-index-item${warning}">
         <div class="file-index-name">${escapeHtml(file.path || file.name)}</div>
         <div class="file-index-metrics">${escapeHtml(fileMetricText(file))}</div>
-        ${file.ocrPages ? '<div class="file-index-help">OCR 信心是引擎估計值，不等於人工校對後的正確率。</div>' : ""}
+        ${file.ocrPages ? '<div class="file-index-help">可疑文字層會保留原文並補跑 OCR；信心值不等於人工校對正確率。</div>' : ""}
       </div>
     `;
   }).join("");
+}
+
+function pageSourceLabel(page) {
+  if (page.method === "hybrid") return "文字層＋OCR";
+  if (page.method === "ocr") return "OCR";
+  return "PDF 文字層";
+}
+
+function pageQualityText(page) {
+  return (page.qualityFlags || [])
+    .map(flag => TEXT_QUALITY_LABELS[flag] || flag)
+    .join("、");
+}
+
+function indexedPageDisplayText(page) {
+  if (page.method === "hybrid" && page.textLayerText && page.ocrText) {
+    return `【PDF 文字層】\n${page.textLayerText}\n\n【OCR 補充】\n${page.ocrText}`;
+  }
+  return page.text || page.searchText || "";
+}
+
+function setBatchTab(tabName) {
+  for (const tab of els.batchTabs) {
+    const active = tab.dataset.batchTab === tabName;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of els.batchPanels) {
+    const active = panel.dataset.batchPanel === tabName;
+    panel.classList.toggle("is-active", active);
+    panel.hidden = !active;
+  }
+}
+
+const AUDIT_ISSUE_LABELS = {
+  "low-confidence": "OCR 低信心",
+  unrecognized: "未辨識到可搜尋文字",
+  suspicious: "可疑文字層",
+  refined: "已精細重辨"
+};
+
+function auditIssuesForPage(page) {
+  return classifyAuditIssues(page, OCR_CONFIDENCE_WARNING);
+}
+
+function auditPriority(entry) {
+  if (entry.issues.includes("unrecognized")) return 0;
+  if (entry.issues.includes("low-confidence")) return 1;
+  if (entry.issues.includes("suspicious")) return 2;
+  return 3;
+}
+
+function getAuditEntries(filter = "all") {
+  return state.indexedPages
+    .map(page => ({ page, issues: auditIssuesForPage(page) }))
+    .filter(entry => entry.issues.length && (filter === "all" || entry.issues.includes(filter)))
+    .sort((left, right) => (
+      auditPriority(left) - auditPriority(right)
+      || left.page.fileId.localeCompare(right.page.fileId)
+      || left.page.page - right.page.page
+    ));
+}
+
+function renderQualityAudit() {
+  if (!els.auditList) return;
+  const allEntries = getAuditEntries();
+  const entries = getAuditEntries(els.auditFilter.value);
+  const files = new Map(state.indexedFiles.map(file => [file.id, file]));
+  els.auditCount.textContent = String(allEntries.length);
+  els.exportReviewBtn.disabled = state.indexing || !allEntries.length;
+
+  if (!entries.length) {
+    els.auditList.innerHTML = '<div class="audit-empty">此分類目前沒有需要複核的頁面。</div>';
+    return;
+  }
+
+  const visibleEntries = entries.slice(0, AUDIT_DISPLAY_LIMIT);
+  const overflow = entries.length > AUDIT_DISPLAY_LIMIT
+    ? `<div class="audit-empty">另有 ${entries.length - AUDIT_DISPLAY_LIMIT} 頁，請匯出清單查看。</div>`
+    : "";
+  els.auditList.innerHTML = visibleEntries.map(({ page, issues }) => {
+    const file = files.get(page.fileId);
+    const issueText = issues.map(issue => AUDIT_ISSUE_LABELS[issue]).join("、");
+    const quality = pageQualityText(page);
+    const confidence = Number.isFinite(page.confidence) ? `${page.confidence}%` : "無";
+    const recheckLabel = page.refined ? "再次精細辨識" : "精細辨識此頁";
+    const reviewing = state.reviewingPageId === page.id;
+    const disabled = state.indexing ? " disabled" : "";
+    return `
+      <div class="audit-item">
+        <div class="audit-item__file">${escapeHtml(file?.path || file?.name || page.fileId)}</div>
+        <div class="audit-item__meta">第 ${page.page} 頁 · ${pageSourceLabel(page)} · OCR 信心 ${confidence}</div>
+        <div class="audit-item__issues">${escapeHtml(issueText)}${quality ? ` · ${escapeHtml(quality)}` : ""}</div>
+        <div class="audit-item__actions">
+          <button class="btn" data-audit-action="open" data-file-id="${escapeHtml(page.fileId)}" data-page="${page.page}"${disabled}>開啟頁面</button>
+          <button class="btn btn--primary" data-audit-action="reocr" data-file-id="${escapeHtml(page.fileId)}" data-page="${page.page}"${disabled}>${reviewing ? "辨識中…" : recheckLabel}</button>
+        </div>
+      </div>
+    `;
+  }).join("") + overflow;
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  const safeText = /^[=+\-@]/.test(text) ? `'${text}` : text;
+  return `"${safeText.replace(/"/g, '""')}"`;
+}
+
+function exportReviewList() {
+  const files = new Map(state.indexedFiles.map(file => [file.id, file]));
+  const rows = [[
+    "檔案",
+    "頁碼",
+    "辨識來源",
+    "OCR 信心",
+    "稽核項目",
+    "品質原因",
+    "精細重辨",
+    "最近重辨時間"
+  ]];
+  for (const { page, issues } of getAuditEntries()) {
+    const file = files.get(page.fileId);
+    rows.push([
+      file?.path || file?.name || page.fileId,
+      page.page,
+      pageSourceLabel(page),
+      Number.isFinite(page.confidence) ? page.confidence : "",
+      issues.map(issue => AUDIT_ISSUE_LABELS[issue]).join("、"),
+      pageQualityText(page),
+      page.refined ? "是" : "否",
+      page.reviewedAt ? new Date(page.reviewedAt).toLocaleString("zh-TW") : ""
+    ]);
+  }
+  const csv = "\uFEFF" + rows.map(row => row.map(csvCell).join(",")).join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "pdf-quality-review.csv";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function stripSearchQuotes(term) {
@@ -597,9 +855,13 @@ function runSearch() {
     </div>
   ` + visibleMatches.map(({ page, evaluation }) => {
     const file = files.get(page.fileId);
-    const confidence = page.method === "ocr" && Number.isFinite(page.confidence)
+    const confidence = (page.method === "ocr" || page.method === "hybrid") && Number.isFinite(page.confidence)
       ? ` · OCR 信心 ${page.confidence}%`
       : "";
+    const source = ` · ${pageSourceLabel(page)}`;
+    const quality = pageQualityText(page);
+    const qualityNote = quality ? ` · 品質提醒：${quality}` : "";
+    const refined = page.refined ? " · 已精細重辨" : "";
     const compound = terms.length > 1
       ? ` · 同頁符合 ${evaluation.matchedCount}/${terms.length} 個詞`
       : "";
@@ -609,9 +871,9 @@ function runSearch() {
         <div class="result-file">${escapeHtml(file?.path || file?.name || page.fileId)}</div>
         <div class="result-meta">
           <span class="result-match-badge result-match-badge--${evaluation.tier}">${tier.label}</span>
-          相似度 ${evaluation.score}% · 第 ${page.page} 頁${confidence}${compound}
+          相似度 ${evaluation.score}% · 第 ${page.page} 頁${source}${confidence}${refined}${compound}${qualityNote}
         </div>
-        <div class="result-snippet">${makeSnippet(page.text, evaluation.termMatches)}</div>
+        <div class="result-snippet">${makeSnippet(page.searchText, evaluation.termMatches)}</div>
       </button>
     `;
   }).join("");
@@ -622,12 +884,29 @@ async function refreshCache() {
   state.indexedFiles = files.sort((a, b) => (a.path || a.name).localeCompare(b.path || b.name));
   state.indexedPages = pages.map(page => {
     const text = normalizeSpace(page.text);
-    return { ...page, text, searchDocument: buildSearchDocument(text) };
+    const searchText = normalizeSpace(page.searchText || text);
+    const textLayerText = normalizeSpace(page.textLayerText
+      || (page.method === "text-layer" ? text : ""));
+    const ocrText = normalizeSpace(page.ocrText
+      || (page.method === "ocr" ? text : ""));
+    return {
+      ...page,
+      text,
+      searchText,
+      textLayerText,
+      ocrText,
+      qualityFlags: Array.isArray(page.qualityFlags) ? page.qualityFlags : [],
+      refined: Boolean(page.refined),
+      searchDocument: buildSearchDocument(searchText)
+    };
   });
-  const recognizedPages = state.indexedPages.filter(page => hasUsefulText(page.text)).length;
-  els.summary.textContent = `已索引 ${files.length} 份 PDF、${pages.length} 頁，其中 ${recognizedPages} 頁可搜尋。`;
+  const recognizedPages = state.indexedPages.filter(page => hasUsefulText(page.searchText)).length;
+  const hybridPages = state.indexedPages.filter(page => page.method === "hybrid").length;
+  const qualitySummary = hybridPages ? `，${hybridPages} 頁採文字層＋OCR 混合辨識` : "";
+  els.summary.textContent = `已索引 ${files.length} 份 PDF、${pages.length} 頁，其中 ${recognizedPages} 頁可搜尋${qualitySummary}。`;
   els.exportBtn.disabled = state.indexing || !pages.length;
   renderFileNotes();
+  renderQualityAudit();
   runSearch();
 }
 
@@ -697,19 +976,96 @@ async function openResult(fileId, pageNumber) {
     const indexedPage = state.indexedPages.find(page => (
       page.fileId === fileId && page.page === pageNumber
     ));
-    if (indexedPage && hasUsefulText(indexedPage.text)) {
-      els.readerText.value = indexedPage.text;
+    if (indexedPage && hasUsefulText(indexedPage.searchText || indexedPage.text)) {
+      els.readerText.value = indexedPageDisplayText(indexedPage);
       els.readerCopyBtn.disabled = false;
       els.readerStripBtn.disabled = false;
-      const source = indexedPage.method === "ocr" ? "OCR" : "PDF 文字層";
-      const confidence = indexedPage.method === "ocr" && Number.isFinite(indexedPage.confidence)
+      const source = pageSourceLabel(indexedPage);
+      const confidence = (indexedPage.method === "ocr" || indexedPage.method === "hybrid")
+        && Number.isFinite(indexedPage.confidence)
         ? `，信心 ${indexedPage.confidence}%`
         : "";
-      els.readerStatus.textContent = `已套用批次索引文字（${source}${confidence}）`;
+      const quality = pageQualityText(indexedPage);
+      const qualityNote = quality ? `；品質提醒：${quality}` : "";
+      els.readerStatus.textContent = `已套用批次索引文字（${source}${confidence}${qualityNote}）`;
     }
   } catch (error) {
     console.error(error);
     setStatus(error.message || String(error));
+  }
+}
+
+function toStoredPage(page) {
+  const { searchDocument, ...storedPage } = page;
+  return storedPage;
+}
+
+async function reRecognizeIndexedPage(fileId, pageNumber) {
+  if (state.indexing || state.reviewingPageId) return;
+  const pageId = `${fileId}::${pageNumber}`;
+  const existingPage = state.indexedPages.find(page => page.id === pageId);
+  if (!existingPage) throw new Error("找不到要重新辨識的索引頁面。");
+
+  state.reviewingPageId = pageId;
+  setIndexing(true, false);
+  let pdf = null;
+  let pdfPage = null;
+  try {
+    const file = await getFileForResult(fileId);
+    const pdfjs = globalThis.pdfjsLib;
+    if (!pdfjs?.getDocument) throw new Error("PDF.js 尚未完成載入");
+
+    setStatus(`載入精細重辨頁面：${file.name} 第 ${pageNumber} 頁…`);
+    const loadingTask = pdfjs.getDocument({ data: await file.arrayBuffer() });
+    pdf = await loadingTask.promise;
+    if (pageNumber < 1 || pageNumber > pdf.numPages) {
+      throw new Error(`PDF 已變更，找不到第 ${pageNumber} 頁。`);
+    }
+
+    pdfPage = await pdf.getPage(pageNumber);
+    const textLayerText = extractTextItems(await pdfPage.getTextContent());
+    const quality = assessTextLayerQuality(textLayerText);
+    const ocrResult = await recognizePageDetailed(
+      pdfPage,
+      `${file.name} 第 ${pageNumber} 頁（人工精細重辨）`
+    );
+    const previousOcrText = existingPage.ocrText
+      || (existingPage.method === "ocr" ? existingPage.text : "");
+    const combinedOcrText = mergeRecognizedTexts(previousOcrText, ocrResult.text).searchText;
+    const merged = mergeRecognizedTexts(textLayerText, combinedOcrText);
+    const updatedPage = {
+      ...toStoredPage(existingPage),
+      text: merged.primaryText,
+      searchText: merged.searchText,
+      textLayerText,
+      ocrText: combinedOcrText,
+      method: quality.hasUsableText ? "hybrid" : "ocr",
+      confidence: ocrResult.confidence,
+      qualityFlags: quality.flags,
+      refined: true,
+      selectedPass: "detail",
+      reviewedAt: Date.now()
+    };
+
+    const filePages = state.indexedPages
+      .filter(page => page.fileId === fileId)
+      .map(page => page.id === pageId ? updatedPage : toStoredPage(page));
+    const fileRecord = await loadFileRecord(fileId);
+    if (!fileRecord) throw new Error("找不到此 PDF 的索引資料。");
+    await replaceFileIndex(
+      { ...fileRecord, ...calculateMetrics(filePages), indexedAt: Date.now() },
+      filePages
+    );
+    await refreshCache();
+    setStatus(`精細重辨完成：${file.name} 第 ${pageNumber} 頁。`);
+  } finally {
+    try {
+      pdfPage?.cleanup();
+      if (pdf) await pdf.destroy();
+    } finally {
+      state.reviewingPageId = null;
+      setIndexing(false);
+    }
   }
 }
 
@@ -756,10 +1112,16 @@ async function exportText() {
       lines.push("", `===== ${file?.path || file?.name || page.fileId} =====`);
       if (file) lines.push(fileMetricText(file));
     }
-    const confidence = page.method === "ocr" && Number.isFinite(page.confidence)
+    const confidence = (page.method === "ocr" || page.method === "hybrid") && Number.isFinite(page.confidence)
       ? `（OCR 信心 ${page.confidence}%）`
       : "";
-    lines.push("", `--- 第 ${page.page} 頁${confidence} ---`, page.text || "[未辨識到文字]");
+    const quality = pageQualityText(page);
+    const qualityNote = quality ? `（${quality}）` : "";
+    lines.push(
+      "",
+      `--- 第 ${page.page} 頁 · ${pageSourceLabel(page)}${confidence}${qualityNote} ---`,
+      indexedPageDisplayText(page) || "[未辨識到文字]"
+    );
   }
   const blob = new Blob([lines.join("\n").trim() + "\n"], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -799,12 +1161,55 @@ els.clearBtn.addEventListener("click", () => clearIndex().catch(error => {
 }));
 
 els.search.addEventListener("input", () => {
+  setBatchTab("search");
   clearTimeout(state.searchTimer);
   state.searchTimer = setTimeout(runSearch, SEARCH_DEBOUNCE_MS);
 });
 
 els.search.addEventListener("keydown", event => event.stopPropagation());
 els.searchMode.addEventListener("change", runSearch);
+els.searchMode.addEventListener("keydown", event => event.stopPropagation());
+
+for (const tab of els.batchTabs) {
+  tab.addEventListener("click", () => setBatchTab(tab.dataset.batchTab));
+  tab.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const currentIndex = els.batchTabs.indexOf(tab);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? els.batchTabs.length - 1
+        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + els.batchTabs.length)
+          % els.batchTabs.length;
+    const nextTab = els.batchTabs[nextIndex];
+    setBatchTab(nextTab.dataset.batchTab);
+    nextTab.focus();
+  });
+}
+
+els.pauseBtn.addEventListener("click", toggleIndexPause);
+
+els.auditFilter.addEventListener("change", renderQualityAudit);
+els.auditFilter.addEventListener("keydown", event => event.stopPropagation());
+
+els.auditList.addEventListener("click", event => {
+  const button = event.target.closest("[data-audit-action]");
+  if (!button || button.disabled) return;
+  const fileId = button.dataset.fileId;
+  const pageNumber = Number(button.dataset.page);
+  if (button.dataset.auditAction === "open") {
+    openResult(fileId, pageNumber);
+  } else if (button.dataset.auditAction === "reocr") {
+    reRecognizeIndexedPage(fileId, pageNumber).catch(error => {
+      console.error(error);
+      setStatus(error.message || String(error));
+    });
+  }
+});
+
+els.exportReviewBtn.addEventListener("click", exportReviewList);
 
 els.results.addEventListener("click", event => {
   const item = event.target.closest(".result-item");

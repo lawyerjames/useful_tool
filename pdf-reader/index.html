@@ -51,16 +51,17 @@
         <div class="text-panel__head">
           <div class="text-panel__row">
             <span id="status" class="status">尚未載入 PDF</span>
+          </div>
+          <div class="text-commandbar">
+            <button id="ocr-btn" class="btn" disabled title="辨識目前頁面的文字">OCR</button>
+            <button id="strip-btn" class="btn" disabled title="移除中文字之間多餘的空白">去空白</button>
+            <button id="copy-btn" class="btn" disabled title="複製全部辨識文字">複製</button>
+            <span class="commandbar-separator" aria-hidden="true"></span>
             <div class="font-size-ctrl" title="調整文字大小">
               <button id="font-dec" class="btn btn--icon" title="縮小文字">A−</button>
               <span id="font-size-label" class="font-size-label">15px</span>
               <button id="font-inc" class="btn btn--icon" title="放大文字">A＋</button>
             </div>
-          </div>
-          <div class="text-panel__row text-panel__actions">
-            <button id="ocr-btn" class="btn" disabled>辨識文字 (OCR)</button>
-            <button id="strip-btn" class="btn" disabled title="移除中文字之間多餘的空白">移除空白</button>
-            <button id="copy-btn" class="btn" disabled>複製全部</button>
           </div>
         </div>
         <textarea
@@ -75,16 +76,22 @@
 
       <aside class="batch-panel">
         <div class="batch-panel__head">
-          <div class="batch-panel__title">批次索引</div>
-          <div class="batch-panel__actions">
-            <button id="pick-folder-btn" class="btn btn--primary">選擇資料夾</button>
-            <label class="btn">
-              選擇 PDF
+          <div class="batch-panel__topline">
+            <div class="batch-panel__title">文件檢索</div>
+            <div id="batch-status" class="batch-status">索引保存在此瀏覽器。</div>
+          </div>
+          <div class="batch-commandbar" aria-label="批次索引操作">
+            <button id="pick-folder-btn" class="btn btn--primary" title="選擇包含 PDF 的資料夾">資料夾</button>
+            <label class="btn" title="選擇一份或多份 PDF">
+              PDF
               <input id="batch-file-input" type="file" accept="application/pdf" multiple hidden />
             </label>
-            <button id="clear-index-btn" class="btn">清除索引</button>
+            <button id="pause-index-btn" class="btn" disabled>暫停</button>
+            <button id="clear-index-btn" class="btn" title="清除所有本機索引">清除</button>
+            <span class="commandbar-separator" aria-hidden="true"></span>
+            <button id="export-text-btn" class="btn" disabled title="匯出全部索引文字">匯文字</button>
+            <button id="export-review-btn" class="btn" disabled title="匯出品質複核清單">匯複核</button>
           </div>
-          <div id="batch-status" class="batch-status">索引保存在此瀏覽器的本機 IndexedDB。</div>
           <progress id="batch-progress" class="batch-progress" max="100" value="0" hidden></progress>
         </div>
 
@@ -94,12 +101,37 @@
             <option value="strict">嚴格</option>
             <option value="recall">防漏</option>
           </select>
-          <button id="export-text-btn" class="btn" disabled>匯出文字</button>
         </div>
 
         <div id="index-summary" class="index-summary"></div>
-        <div id="index-files" class="index-files" aria-live="polite"></div>
-        <div id="search-results" class="search-results"></div>
+        <div class="batch-tabs" role="tablist" aria-label="檢索內容">
+          <button class="batch-tab is-active" type="button" role="tab" aria-selected="true" data-batch-tab="search">搜尋結果</button>
+          <button class="batch-tab" type="button" role="tab" aria-selected="false" data-batch-tab="audit">
+            品質稽核 <span id="audit-count" class="audit-count">0</span>
+          </button>
+          <button class="batch-tab" type="button" role="tab" aria-selected="false" data-batch-tab="files">索引檔案</button>
+        </div>
+
+        <section class="batch-tab-panel is-active" data-batch-panel="search">
+          <div id="search-results" class="search-results"></div>
+        </section>
+
+        <section id="quality-audit" class="batch-tab-panel quality-audit" data-batch-panel="audit" hidden>
+          <div class="audit-controls">
+            <select id="audit-filter" class="audit-filter" aria-label="品質稽核分類">
+              <option value="all">全部稽核頁面</option>
+              <option value="low-confidence">低信心</option>
+              <option value="unrecognized">無法辨識</option>
+              <option value="suspicious">可疑文字層</option>
+              <option value="refined">已精細重辨</option>
+            </select>
+          </div>
+          <div id="audit-list" class="audit-list" aria-live="polite"></div>
+        </section>
+
+        <section class="batch-tab-panel" data-batch-panel="files" hidden>
+          <div id="index-files" class="index-files" aria-live="polite"></div>
+        </section>
       </aside>
     </main>
   </body>
